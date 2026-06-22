@@ -1,0 +1,49 @@
+.scan-form {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+  max-width: 600px;
+}
+
+.scan-form__input {
+  flex: 1;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255,255,255,0.1);
+  color: #fff;
+  padding: 12px 20px;
+  border-radius: 99px;
+  font-size: 0.95rem;
+  outline: none;
+  transition: all 0.3s ease;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.2) inset;
+}
+
+.scan-form__input:focus {
+  border-color: var(--neon-primary);
+  box-shadow: 0 0 0 2px rgba(124, 92, 255, 0.2), 0 0 12px var(--neon-primary-glow) inset;
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.scan-form__input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.scan-form__btn {
+  white-space: nowrap;
+}
+
+@media (max-width: 768px) {
+  .scan-form {
+    flex-direction: column;
+    gap: 12px;
+  }
+  .scan-form__input {
+    width: 100%;
+  }
+  .scan-form__btn {
+    width: 100%;
+    justify-content: center;
+  }
+}

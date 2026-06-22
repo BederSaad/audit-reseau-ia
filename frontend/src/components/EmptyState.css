@@ -1,0 +1,74 @@
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 80px 20px;
+  text-align: center;
+  min-height: 400px;
+}
+
+.empty-state h3 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 12px;
+}
+
+.empty-state p {
+  color: var(--color-text-secondary);
+  max-width: 400px;
+  font-size: 0.95rem;
+}
+
+.empty-radar {
+  position: relative;
+  width: 100px;
+  height: 100px;
+  margin-bottom: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.empty-radar-dot {
+  width: 12px;
+  height: 12px;
+  background: var(--neon-primary);
+  border-radius: 50%;
+  box-shadow: 0 0 16px var(--neon-primary-glow);
+  z-index: 2;
+}
+
+.empty-radar-ring {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  border: 2px solid var(--neon-primary);
+  opacity: 0;
+  z-index: 1;
+}
+
+.empty-radar-ring-1 {
+  animation: radar-pulse 3s infinite ease-out;
+}
+
+.empty-radar-ring-2 {
+  animation: radar-pulse 3s infinite ease-out;
+  animation-delay: 1.5s;
+}
+
+@keyframes radar-pulse {
+  0% {
+    width: 0;
+    height: 0;
+    opacity: 0.8;
+  }
+  100% {
+    width: 150px;
+    height: 150px;
+    opacity: 0;
+  }
+}

@@ -1,0 +1,30 @@
+.gauge-wrap {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.gauge-center {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+.gauge-score {
+  font-size: 2.4rem;
+  font-weight: 800;
+  line-height: 1;
+}
+.gauge-label {
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+.gauge-sub {
+  font-size: 0.72rem;
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}

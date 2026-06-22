@@ -1,0 +1,289 @@
+/* =====================================================================
+   GLOBAL CSS — Futuristic Fintech / Cyber-Glass Design System
+   ===================================================================== */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap');
+
+:root {
+  /* Brand */
+  --neon-primary:     #00E5FF;
+  --neon-primary-glow: rgba(0, 229, 255, 0.5);
+  --neon-secondary:   #B500FF;
+  --neon-secondary-glow: rgba(181, 0, 255, 0.5);
+
+  /* Severity palette */
+  --neon-critical:    #FF2D55;
+  --neon-critical-glow: rgba(255, 45, 85, 0.4);
+  --neon-high:        #FF8A00;
+  --neon-high-glow:   rgba(255, 138, 0, 0.4);
+  --neon-medium:      #FFD60A;
+  --neon-medium-glow: rgba(255, 214, 10, 0.4);
+  --neon-low:         #0AFFEF;
+  --neon-low-glow:    rgba(10, 255, 239, 0.4);
+  --neon-info:        #39FF6E;
+  --neon-info-glow:   rgba(57, 255, 110, 0.4);
+  --neon-safe:        #39FF6E;
+  --neon-safe-glow:   rgba(57, 255, 110, 0.4);
+
+  /* Status */
+  --color-running:    #0AFFEF;
+  --color-done:       #39FF6E;
+  --color-failed:     #FF2D55;
+  --color-pending:    #8B949E;
+
+  /* Surfaces & Text */
+  --bg-page:          #02040A;
+  --bg-glass:         rgba(10, 15, 30, 0.4);
+  --bg-glass-hover:   rgba(20, 25, 45, 0.6);
+  --color-border:     rgba(0, 229, 255, 0.15);
+  
+  --color-text:           #F8FAFC;
+  --color-text-secondary: #94A3B8;
+  --color-text-muted:     #64748B;
+
+  /* Typography */
+  --font-sans: 'Inter', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  /* Effects */
+  --shadow-glass:     0 8px 32px rgba(0, 0, 0, 0.6), 0 0 10px rgba(0, 229, 255, 0.05) inset;
+  --radius-sm:        6px;
+  --radius-md:        10px;
+  --radius-lg:        16px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--font-sans);
+  background: radial-gradient(ellipse at top, #0A0D18 0%, #02040A 70%, #000000 100%);
+  background-attachment: fixed;
+  color: var(--color-text);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+  position: relative;
+}
+
+/* Subtle animated noise/grid overlay */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image: 
+    linear-gradient(rgba(0, 229, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 229, 255, 0.05) 1px, transparent 1px);
+  background-size: 50px 50px;
+  opacity: 0.8;
+  pointer-events: none;
+  animation: panGrid 40s linear infinite;
+  z-index: -1;
+}
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(circle at 50% 50%, transparent 20%, #02040A 100%);
+  pointer-events: none;
+  z-index: -1;
+}
+
+@keyframes panGrid {
+  0% { transform: translateY(0); }
+  100% { transform: translateY(50px); }
+}
+
+a { color: var(--neon-primary); text-decoration: none; }
+a:hover { text-shadow: 0 0 8px var(--neon-primary-glow); }
+
+button { font-family: inherit; cursor: pointer; }
+
+/* ─── Scrollbar ─────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+
+/* ─── Utility ────────────────────────────────────────────────────────── */
+.glass-panel {
+  background: var(--bg-glass);
+  backdrop-filter: blur(24px) saturate(200%);
+  -webkit-backdrop-filter: blur(24px) saturate(200%);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-glass);
+  position: relative;
+  overflow: hidden;
+}
+.glass-panel::before {
+  content: "";
+  position: absolute;
+  top: 0; left: 0; right: 0; height: 1px;
+  background: linear-gradient(90deg, transparent, var(--neon-primary), transparent);
+  opacity: 0.5;
+}
+
+.mono { font-family: var(--font-mono); }
+
+.neon-text {
+  text-shadow: 0 0 12px var(--neon-primary-glow);
+}
+
+/* ─── Buttons ───────────────────────────────────────────────────────── */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 28px;
+  background: linear-gradient(135deg, var(--neon-primary), var(--neon-secondary));
+  color: #000;
+  font-weight: 800;
+  font-size: 0.95rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  border: none;
+  border-radius: var(--radius-sm);
+  box-shadow: 0 4px 16px var(--neon-primary-glow);
+  transition: all 300ms cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+}
+.btn-primary::after {
+  content: "";
+  position: absolute;
+  top: -50%; left: -50%; width: 200%; height: 200%;
+  background: linear-gradient(rgba(255,255,255,0.2), transparent, transparent);
+  transform: rotate(45deg);
+  transition: all 300ms;
+}
+.btn-primary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 32px var(--neon-secondary-glow);
+}
+.btn-primary:hover::after {
+  top: -100%; left: -100%;
+}
+.btn-primary:active { transform: scale(0.98); }
+.btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  transform: none;
+  filter: grayscale(1);
+  box-shadow: none;
+}
+
+/* ─── Badges ────────────────────────────────────────────────────────── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: 99px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  background: rgba(0,0,0,0.3);
+  border: 1px solid currentColor;
+}
+.badge--critical { color: var(--neon-critical); box-shadow: 0 0 8px var(--neon-critical-glow) inset; }
+.badge--high     { color: var(--neon-high);     box-shadow: 0 0 8px var(--neon-high-glow) inset; }
+.badge--medium   { color: var(--neon-medium);   box-shadow: 0 0 8px var(--neon-medium-glow) inset; }
+.badge--low      { color: var(--neon-low);      box-shadow: 0 0 8px var(--neon-low-glow) inset; }
+.badge--info     { color: var(--neon-info);     box-shadow: 0 0 8px var(--neon-info-glow) inset; }
+.badge--safe     { color: var(--neon-safe);     box-shadow: 0 0 8px var(--neon-safe-glow) inset; }
+
+.badge--audited  { 
+  background: rgba(124, 92, 255, 0.15); 
+  color: var(--neon-primary); 
+  border-color: var(--neon-primary);
+  box-shadow: 0 0 10px var(--neon-primary-glow);
+}
+.badge--detected { 
+  background: transparent; 
+  color: var(--color-text-secondary); 
+  border: 1px dashed var(--color-text-muted); 
+}
+
+/* ─── Unknown field styling ─────────────────────────────────────────── */
+.unknown-val {
+  color: var(--color-text-muted);
+  font-style: italic;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.unknown-tooltip {
+  position: relative;
+  display: inline-flex;
+  cursor: help;
+  color: var(--color-text-secondary);
+  background: rgba(255,255,255,0.1);
+  border-radius: 50%;
+  width: 16px; height: 16px;
+  align-items: center; justify-content: center;
+  font-size: 0.7rem; font-style: normal;
+}
+.unknown-tooltip::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: 150%;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1E293B;
+  color: #fff;
+  font-size: 0.72rem;
+  padding: 6px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms;
+  z-index: 100;
+  border: 1px solid rgba(255,255,255,0.1);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+}
+.unknown-tooltip:hover::after { opacity: 1; }
+
+/* ─── Skeleton ──────────────────────────────────────────────────────── */
+@keyframes glass-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.skeleton {
+  border-radius: var(--radius-sm);
+  background: linear-gradient(90deg, 
+    rgba(255,255,255,0.02) 25%, 
+    rgba(255,255,255,0.06) 50%, 
+    rgba(255,255,255,0.02) 75%
+  );
+  background-size: 200% 100%;
+  animation: glass-shimmer 2s infinite linear;
+}
+
+/* ─── Error Banner ──────────────────────────────────────────────────── */
+.error-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+  background: rgba(255, 45, 85, 0.1);
+  border: 1px solid var(--neon-critical);
+  box-shadow: 0 0 20px var(--neon-critical-glow);
+  color: #fff;
+  border-radius: var(--radius-md);
+  font-size: 0.9rem;
+  font-weight: 500;
+  margin-bottom: 20px;
+  backdrop-filter: blur(10px);
+}
+.error-banner button {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 1.2rem;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.error-banner button:hover { opacity: 1; }

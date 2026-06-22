@@ -1,0 +1,62 @@
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 24px;
+}
+
+.kpi-card {
+  position: relative;
+  overflow: hidden;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.kpi-card__glow {
+  position: absolute;
+  top: 50%;
+  right: -20%;
+  transform: translateY(-50%);
+  width: 120px;
+  height: 120px;
+  background: radial-gradient(circle, var(--card-glow) 0%, transparent 70%);
+  opacity: 0.5;
+  pointer-events: none;
+  animation: pulse-glow 4s infinite alternate ease-in-out;
+}
+
+@keyframes pulse-glow {
+  0% { transform: translateY(-50%) scale(1); opacity: 0.3; }
+  100% { transform: translateY(-50%) scale(1.2); opacity: 0.6; }
+}
+
+.kpi-card__content {
+  position: relative;
+  z-index: 1;
+}
+
+.kpi-card__label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-secondary);
+  margin-bottom: 8px;
+}
+
+.kpi-card__value {
+  font-size: 2.5rem;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  line-height: 1;
+  text-shadow: 0 0 16px currentColor;
+}
+
+@media (max-width: 1024px) {
+  .kpi-row { grid-template-columns: 1fr 1fr; }
+}
+
+@media (max-width: 640px) {
+  .kpi-row { grid-template-columns: 1fr; }
+}

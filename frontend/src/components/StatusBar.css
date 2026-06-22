@@ -1,0 +1,29 @@
+.status-bar {
+  display: flex;
+  align-items: center;
+}
+
+.status-bar__chip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.05);
+  padding: 6px 14px;
+  border-radius: 99px;
+  backdrop-filter: blur(8px);
+}
+
+.status-bar__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.status-bar__text {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #fff;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
