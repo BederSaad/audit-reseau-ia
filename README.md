@@ -35,7 +35,7 @@ Backend : FastAPI (Python), Uvicorn, Pydantic (Validation stricte des inputs), a
 
 Base de Données & ORM : PostgreSQL, SQLAlchemy (Couche d'abstraction relationnelle).
 
-Frontend : React.js, Tailwind CSS (Composants interactifs, esthétique minimaliste et moderne type Glassmorphism).
+Frontend : React.js, Vite, Vanilla CSS (Composants interactifs, esthétique minimaliste et moderne type Cyber/Glassmorphism).
 
 Déploiement : Docker, Docker Compose pour une isolation totale des briques applicatives.
 
@@ -45,10 +45,11 @@ audit-reseau-ia/
 ├── backend/                  # Moteur d'API et orchestration de sécurité
 │   ├── database.py           # Configuration de la session PostgreSQL et de l'engine
 │   ├── models.py             # Schémas relationnels SQLAlchemy (Scans, Hosts, Services, Vulns)
-│   ├── main.py               # Endpoints de l'API et logique des wrappers de scan
+│   ├── main.py               # Endpoints de l'API et logique des wrappers de scan optimisés
 │   └── requirements.txt      # Dépendances Python du projet
 ├── frontend/                 # Interface utilisateur de la plateforme
 │   ├── src/                  # Composants React et layout du Dashboard
+│   ├── vite.config.js        # Configuration du bundler Vite
 │   └── package.json          # Dépendances et scripts Node.js
 ├── docs/                     # Documentation de conception et journal de bord technique
 └── tests/                    # Validations unitaires et tests d'intégration des pipelines
@@ -57,10 +58,10 @@ audit-reseau-ia/
 🗺️ Feuille de Route & Statut d'Avancement
 | Phase | Objectif Fonctionnel | Statut |
 |---|---|---|
-| Phase 1 | Initialisation Frontend React & Design System (Fintech/Glassmorphism) | Complété |
-| Phase 1 | Configuration FastAPI & Wrapper d'exécution Nmap (Correction Bug Windows) | Complété |
-| Phase 1 | Intégration du Moteur Nuclei & Persistance Base de Données PostgreSQL | 🔄 En Cours |
-| Phase 2 | Implémentation du Moteur de Corrélation CVE & Scoring de Risque CVSS | ⏳ En Attente |
+| Phase 1 | Initialisation Frontend React & Design System (Cyber/Glassmorphism) | ✅ Complété |
+| Phase 1 | Configuration FastAPI & Wrapper Nmap (Optimisation vitesse & OS fallback) | ✅ Complété |
+| Phase 1 | Intégration du Moteur Nuclei & Persistance Base de Données PostgreSQL | ✅ Complété |
+| Phase 2 | Implémentation du Moteur de Corrélation CVE & Scoring de Risque CVSS | ✅ Complété |
 | Phase 3 | Déploiement de l'Agent IA Conversationnel & Intégration RAG Cyber | ⏳ En Attente |
 | Phase 4 | Conteneurisation Multi-services Docker & Préparation de la Soutenance | ⏳ En Attente |
 
@@ -80,7 +81,7 @@ CREATE DATABASE audit_db;
 ```
 
 3. Lancement du Serveur Backend (FastAPI)
-Ouvrez un terminal avec des privilèges administratifs ("Exécuter en tant qu'administrateur") et exécutez :
+Ouvrez un terminal avec des privilèges administratifs ("Exécuter en tant qu'administrateur" requis pour les scans réseaux avancés) et exécutez :
 
 ```bash
 # Accéder au dossier du backend
@@ -94,7 +95,7 @@ python -m uvicorn main:app --reload
 ```
 💡 La documentation interactive complète du projet et l'interface de test des routes sont disponibles en temps réel à l'adresse : http://127.0.0.1:8000/docs
 
-4. Lancement du Tableau de Bord Frontend (React)
+4. Lancement du Tableau de Bord Frontend (React/Vite)
 Dans un second terminal dissocié :
 
 ```bash
@@ -105,9 +106,9 @@ cd frontend
 npm install
 
 # Démarrer le serveur de développement local
-npm start
+npm run dev
 ```
-L'interface utilisateur s'ouvrira automatiquement à l'adresse http://localhost:3000.
+L'interface utilisateur s'ouvrira automatiquement, généralement à l'adresse http://localhost:5173.
 
 👥 Équipe et Cadre de Réalisation
 Développeur & Concepteur : Beder Saad
