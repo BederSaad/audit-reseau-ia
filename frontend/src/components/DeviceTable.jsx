@@ -20,16 +20,18 @@ function HostRow({ host, index }) {
   const isAudited = (host.services?.length ?? 0) > 0;
   const vulnCount = host.vulnerabilities?.length ?? 0;
   const maxSev    = getMaxSeverity(host.vulnerabilities ?? []);
+  const hasCredIssues = host.vulnerabilities?.some(v => v.source === 'credential_test' && v.severity === 'critical');
 
   return (
     <>
       <tr
-        className={`device-row ${open ? 'device-row--open' : ''}`}
+        className={`device-row ${open ? 'device-row--open' : ''} ${hasCredIssues ? 'device-row--cred-warning' : ''}`}
         onClick={() => setOpen(o => !o)}
       >
         <td>
           <span className="status-dot-pair">
             <span className={`status-dot status-dot--${host.status || 'up'}`} />
+            {hasCredIssues && <span className="cred-warning-dot" title="Identifiants faibles détectés">🔑</span>}
           </span>
         </td>
         <td>

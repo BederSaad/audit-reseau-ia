@@ -19,6 +19,44 @@ function SevBadge({ sev }) {
   return <span className={`badge badge--${s}`}>{sev}</span>;
 }
 
+function SourceBadge({ source }) {
+  if (!source) return null;
+  
+  const sourceConfig = {
+    'credential_test': { 
+      label: '🔑 Credentials', 
+      className: 'badge--cred',
+      color: '#FF2D55' 
+    },
+    'nuclei': { 
+      label: '🔍 Nuclei', 
+      className: 'badge--nuclei',
+      color: '#00E5FF' 
+    },
+    'nvd': { 
+      label: '🌐 NVD', 
+      className: 'badge--nvd',
+      color: '#B500FF' 
+    }
+  };
+  
+  const config = sourceConfig[source] || { label: source, className: '', color: '#94A3B8' };
+  
+  return (
+    <span 
+      className={`badge badge--source ${config.className}`}
+      style={{ 
+        borderColor: config.color,
+        color: config.color,
+        boxShadow: `0 0 8px ${config.color}40`
+      }}
+      title={`Source: ${source}`}
+    >
+      {config.label}
+    </span>
+  );
+}
+
 function CvssBar({ score }) {
   if (score == null) return <span className="unknown-val"><em>N/A</em></span>;
   const pct = Math.min(100, (score / 10) * 100);
@@ -142,6 +180,7 @@ export default function HostDetailPanel({ host }) {
               <thead>
                 <tr>
                   <th>Sévérité</th>
+                  <th>Source</th>
                   <th>CVE / Template</th>
                   <th>Nom</th>
                   <th>CVSS</th>
@@ -152,12 +191,20 @@ export default function HostDetailPanel({ host }) {
               <tbody>
                 {sortedVulns.map((v, i) => {
                   const sev = (v.severity || 'info').toLowerCase();
+                  const isCredTest = v.source === 'credential_test';
+                  const isExposureOnly = v.template_id?.startsWith('exposure-');
+                  
                   return (
                     <tr
                       key={i}
-                      style={{ borderLeft: `3px solid var(--color-${sev === 'safe' ? 'safe' : sev})` }}
+                      className={isCredTest ? 'vuln-row--cred' : ''}
+                      style={{ 
+                        borderLeft: `3px solid var(--color-${sev === 'safe' ? 'safe' : sev})`,
+                        background: isCredTest ? 'rgba(255, 45, 85, 0.05)' : undefined
+                      }}
                     >
                       <td><SevBadge sev={v.severity} /></td>
+                      <td><SourceBadge source={v.source} /></td>
                       <td>
                         {v.cve_id ? (
                           <a
@@ -172,7 +219,12 @@ export default function HostDetailPanel({ host }) {
                           <span className="template-id">{v.template_id || '—'}</span>
                         )}
                       </td>
-                      <td className="vuln-name">{v.name || '—'}</td>
+                      <td className="vuln-name">
+                        {v.name || '—'}
+                        {isCredTest && !isExposureOnly && (
+                          <span className="cred-indicator">⚠️</span>
+                        )}
+                      </td>
                       <td><CvssBar score={v.cvss_score} /></td>
                       <td>
                         <UnknownVal value={v.matcher_name} />

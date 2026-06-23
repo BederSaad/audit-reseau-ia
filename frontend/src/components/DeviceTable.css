@@ -52,7 +52,7 @@
   font-weight: 500;
 }
 
-.status-dot-pair { display: inline-flex; }
+.status-dot-pair { display: inline-flex; align-items: center; gap: 8px; }
 .status-dot {
   width: 8px; height: 8px;
   border-radius: 50%;
@@ -60,6 +60,25 @@
 }
 .status-dot--up   { background: var(--neon-safe); box-shadow: 0 0 8px var(--neon-safe-glow); }
 .status-dot--down { background: var(--neon-critical); box-shadow: 0 0 8px var(--neon-critical-glow); }
+
+.cred-warning-dot {
+  font-size: 0.8rem;
+  animation: cred-pulse 1.5s ease-in-out infinite;
+  cursor: help;
+}
+
+@keyframes cred-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.2); opacity: 0.8; }
+}
+
+.device-row--cred-warning {
+  background: rgba(255, 45, 85, 0.03) !important;
+}
+
+.device-row--cred-warning:hover td {
+  background: rgba(255, 45, 85, 0.08) !important;
+}
 
 .chevron {
   display: inline-block;

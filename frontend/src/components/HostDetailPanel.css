@@ -185,3 +185,44 @@
   font-weight: 600;
 }
 .see-more-btn:hover { text-decoration: underline; }
+
+/* Source badges */
+.badge--source {
+  font-size: 0.68rem;
+  padding: 2px 8px;
+  background: rgba(0,0,0,0.2);
+  border-width: 1px;
+  border-style: solid;
+  white-space: nowrap;
+}
+
+.badge--cred {
+  animation: pulse-cred 2s ease-in-out infinite;
+}
+
+@keyframes pulse-cred {
+  0%, 100% { box-shadow: 0 0 8px rgba(255, 45, 85, 0.4); }
+  50% { box-shadow: 0 0 16px rgba(255, 45, 85, 0.6); }
+}
+
+/* Credential vulnerability row styling */
+.vuln-row--cred {
+  background: rgba(255, 45, 85, 0.08) !important;
+  transition: background 0.3s ease;
+}
+
+.vuln-row--cred:hover {
+  background: rgba(255, 45, 85, 0.15) !important;
+}
+
+.cred-indicator {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 0.9rem;
+  animation: bounce-cred 1s ease-in-out infinite;
+}
+
+@keyframes bounce-cred {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-3px); }
+}

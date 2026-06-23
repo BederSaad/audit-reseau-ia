@@ -37,6 +37,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.future import select
 from sqlalchemy.orm import declarative_base, relationship, selectinload
 
+# ── 4. Service module imports ───────────────────────────────────────────────
+from services.credential_testing import run_credential_tests, credential_results_to_vulnerabilities
+from services.cve_enrichment import enrich_vulnerabilities_list
+
 # =============================================================================
 # LOGGING
 # =============================================================================
@@ -681,6 +685,25 @@ async def persist_results(scan_id: str, host_results: list[dict]) -> None:
                         discovered_at=datetime.utcnow(),
                     ))
 
+                # ── Add credential testing vulnerabilities if any
+                cred_results = hr.get("cred_vulns", [])
+                if cred_results:
+                    cred_vulns = credential_results_to_vulnerabilities(host.id, cred_results)
+                    for cred_vuln in cred_vulns:
+                        session.add(Vulnerability(
+                            host_id=host.id,
+                            template_id=cred_vuln["template_id"],
+                            name=cred_vuln["name"],
+                            severity=cred_vuln["severity"],
+                            cve_id=cred_vuln["cve_id"],
+                            description=cred_vuln["description"],
+                            matcher_name=cred_vuln["matcher_name"],
+                            cvss_score=cred_vuln["cvss_score"],
+                            cvss_estimated=cred_vuln["cvss_estimated"],
+                            source=cred_vuln["source"],
+                            discovered_at=cred_vuln["discovered_at"],
+                        ))
+
             await session.execute(
                 update(Scan)
                 .where(Scan.id == scan_id)
@@ -775,6 +798,54 @@ async def run_pipeline(scan_id: str, target: str) -> None:
             else:
                 host_results[i]["vulns"] = res
 
+        # =========================================================================
+        # 🔑 NEW STAGE: CREDENTIAL TESTING
+        # =========================================================================
+        logger.info("[CRED TEST] Starting credential testing stage")
+        cred_test_tasks = []
+        for hr in host_results:
+            if target_ip is None or hr["ip"] == target_ip:
+                cred_test_tasks.append(run_credential_tests(hr))
+            else:
+                async def _empty_cred():
+                    return []
+                cred_test_tasks.append(_empty_cred())
+
+        cred_results_raw = await asyncio.gather(*cred_test_tasks, return_exceptions=True)
+
+        # Merge credential vulnerabilities into host results
+        for i, res in enumerate(cred_results_raw):
+            if isinstance(res, Exception):
+                logger.error(f"[CRED TEST] Error for host {host_results[i]['ip']}: {res}")
+                host_results[i]["cred_vulns"] = []
+            else:
+                # Credential vulnerabilities will be added during persist phase
+                host_results[i]["cred_vulns"] = res if res else []
+
+        # =========================================================================
+        # 🔍 NEW STAGE: CVE ENRICHMENT  
+        # =========================================================================
+        logger.info("[CVE ENRICH] Starting CVE enrichment stage")
+        all_vulns = []
+        for hr in host_results:
+            all_vulns.extend(hr.get("vulns", []))
+            all_vulns.extend(hr.get("cred_vulns", []))
+
+        if all_vulns:
+            # Enrich vulnerabilities with NVD data
+            enriched_vulns = await enrich_vulnerabilities_list(all_vulns)
+            
+            # Distribute enriched vulns back to hosts
+            vuln_index = 0
+            for hr in host_results:
+                total_vulns = len(hr.get("vulns", [])) + len(hr.get("cred_vulns", []))
+                if total_vulns > 0:
+                    hr["all_enriched_vulns"] = enriched_vulns[vuln_index:vuln_index + total_vulns]
+                    vuln_index += total_vulns
+                else:
+                    hr["all_enriched_vulns"] = []
+        # =========================================================================
+
         # Step 4 — atomic DB write
         await persist_results(scan_id, host_results)
 
@@ -804,8 +875,8 @@ def normalize_target(raw: str) -> str:
 # =============================================================================
 app = FastAPI(
     title="Network Audit API",
-    description="Automated host discovery, service scanning, and vulnerability assessment.",
-    version="2.0.0",
+    description="Automated host discovery, service scanning, credential testing, and vulnerability assessment with CVE enrichment.",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -823,6 +894,8 @@ async def startup() -> None:
     logger.info("✅ Database tables ready.")
     logger.info(f"📡 nmap   → {NMAP_PATH}")
     logger.info(f"🔍 nuclei → {NUCLEI_PATH}")
+    logger.info("🔑 Credential testing module loaded")
+    logger.info("🌐 CVE enrichment module loaded")
 
 
 # ── POST /scan ────────────────────────────────────────────────────────────────
