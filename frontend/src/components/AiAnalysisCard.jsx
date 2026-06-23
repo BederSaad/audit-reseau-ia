@@ -11,32 +11,53 @@ const AiAnalysisCard = ({ scanId }) => {
   useEffect(() => {
     if (!scanId) return;
 
-    console.log('[AiAnalysisCard] Fetching analysis for scanId:', scanId);
+    console.log('[AiAnalysisCard] Component mounted with scanId:', scanId);
 
-    const fetchAnalysis = async (retryCount = 0) => {
+    let mounted = true;
+    let retryCount = 0;
+    const maxRetries = 15; // Try for up to 30 seconds (15 * 2s)
+
+    const fetchAnalysis = async () => {
+      if (!mounted) return;
+
+      console.log(`[AiAnalysisCard] Fetching analysis (attempt ${retryCount + 1}/${maxRetries + 1})`);
+
       try {
         setLoading(true);
         setError(null);
         const { data } = await getAnalysis(scanId);
-        console.log('[AiAnalysisCard] Analysis data received:', data);
-        setAnalysis(data);
+        if (mounted) {
+          console.log('[AiAnalysisCard] Analysis fetched successfully');
+          setAnalysis(data);
+          setLoading(false);
+        }
       } catch (err) {
-        console.error('[AiAnalysisCard] Error fetching analysis:', err);
-        if (err.response?.status === 404 && retryCount < 3) {
-          console.log('[AiAnalysisCard] Analysis not found yet, retrying in 2s...');
-          setTimeout(() => fetchAnalysis(retryCount + 1), 2000);
+        if (!mounted) return;
+
+        console.log('[AiAnalysisCard] Error:', err.response?.status, err.response?.data);
+
+        if (err.response?.status === 404 && retryCount < maxRetries) {
+          retryCount++;
+          console.log(`[AiAnalysisCard] Retrying in 2s... (${retryCount}/${maxRetries})`);
+          setTimeout(() => fetchAnalysis(), 2000);
         } else if (err.response?.status === 404) {
+          console.log('[AiAnalysisCard] Max retries reached, showing error');
           setError("L'analyse IA sera disponible une fois le scan terminé.");
+          setLoading(false);
         } else {
+          console.log('[AiAnalysisCard] Other error, showing error');
           setError(err.response?.data?.detail || "Erreur de chargement de l'analyse.");
           setLoading(false);
         }
-      } finally {
-        if (retryCount === 0) setLoading(false);
       }
     };
 
     fetchAnalysis();
+
+    return () => {
+      console.log('[AiAnalysisCard] Component unmounting');
+      mounted = false;
+    };
   }, [scanId]);
 
   if (loading) {

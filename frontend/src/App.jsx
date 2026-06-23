@@ -275,7 +275,10 @@ function Dashboard() {
 
         {/* AI Audit Analysis Card */}
         {hasData && displayData?.status === 'done' && (
-          <AiAnalysisCard scanId={displayData.scan_id ?? displayData.id} />
+          <AiAnalysisCard 
+            key={`${displayData.scan_id ?? displayData.id}-${displayData.status}`}
+            scanId={displayData.scan_id ?? displayData.id} 
+          />
         )}
 
         {/* Skeleton while running */}
