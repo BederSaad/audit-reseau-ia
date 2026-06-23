@@ -3,7 +3,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Column, DateTime, ForeignKey, Integer, String,
-    UniqueConstraint, Text, Float, Boolean
+    UniqueConstraint, Text, Float, Boolean, JSON
 )
 from sqlalchemy.orm import relationship
 
@@ -64,3 +64,38 @@ class Vulnerability(Base):
     discovered_at = Column(DateTime, default=datetime.utcnow)
     matched_at    = Column(DateTime, default=datetime.utcnow)
     host          = relationship("Host", back_populates="vulnerabilities")
+
+
+class AuditAnalysis(Base):
+    __tablename__ = "audit_analysis"
+    id                = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    scan_id           = Column(String, ForeignKey("scans.id", ondelete="CASCADE"), unique=True, nullable=False)
+    security_score    = Column(Integer, nullable=True)
+    maturity_level    = Column(String, nullable=True)
+    executive_summary = Column(Text, nullable=False, default="")
+    attack_vectors    = Column(JSON, nullable=False, default=list)
+    most_dangerous_vulnerabilities = Column(JSON, nullable=False, default=list)
+    business_impact   = Column(JSON, nullable=False, default=dict)
+    likelihood_of_compromise = Column(String, nullable=True)
+    attacker_scenario = Column(Text, nullable=False, default="")
+    security_strengths = Column(JSON, nullable=False, default=list)
+    security_weaknesses = Column(JSON, nullable=False, default=list)
+    global_risk_conclusion = Column(Text, nullable=False, default="")
+    key_findings      = Column(JSON, nullable=False, default=list)
+    strategic_recommendations = Column(JSON, nullable=False, default=list)
+    overall_verdict   = Column(String, nullable=False, default="")
+    ai_generated      = Column(Boolean, default=False)
+    generated_at      = Column(DateTime, default=datetime.utcnow)
+
+
+class LLMDecisionLog(Base):
+    __tablename__ = "llm_decision_logs"
+    id            = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    scan_id       = Column(String, nullable=True)
+    host_ip       = Column(String, nullable=True)
+    decision_type = Column(String, nullable=True)
+    input_summary = Column(Text, nullable=True)
+    output_summary= Column(Text, nullable=True)
+    status        = Column(String, nullable=True)
+    duration_ms   = Column(Integer, nullable=True)
+    created_at    = Column(DateTime, default=datetime.utcnow)

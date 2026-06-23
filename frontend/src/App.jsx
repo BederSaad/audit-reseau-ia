@@ -11,6 +11,8 @@ import SeverityDonut   from './components/charts/SeverityDonut';
 import TopHostsBar     from './components/charts/TopHostsBar';
 import HealthGauge     from './components/charts/HealthGauge';
 import TiltCard        from './components/TiltCard';
+import AiAnalysisCard  from './components/AiAnalysisCard';
+import PdfDownloadButton from './components/PdfDownloadButton';
 import axios from 'axios';
 
 const API = axios.create({ baseURL: 'http://localhost:8000' });
@@ -224,6 +226,12 @@ function Dashboard() {
                 </span>
               </div>
             )}
+            {/* PDF download button */}
+            {displayData.status === 'done' && (
+              <div className="scan-meta__item" style={{ marginLeft: 'auto' }}>
+                <PdfDownloadButton scanId={displayData.scan_id ?? displayData.id} />
+              </div>
+            )}
           </div>
         )}
 
@@ -263,6 +271,11 @@ function Dashboard() {
               <HealthGauge healthScore={displayData?.health_score ?? 100} />
             </TiltCard>
           </div>
+        )}
+
+        {/* AI Audit Analysis Card */}
+        {hasData && displayData?.status === 'done' && (
+          <AiAnalysisCard scanId={displayData.scan_id ?? displayData.id} />
         )}
 
         {/* Skeleton while running */}

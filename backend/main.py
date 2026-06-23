@@ -26,12 +26,12 @@ except ImportError:
     pass  # python-dotenv not installed; use environment variables directly
 
 # ── 3. Third-party imports ────────────────────────────────────────────────────
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import (
     Column, DateTime, ForeignKey, Float, Integer, String,
-    UniqueConstraint, delete, update, Boolean, Text,
+    UniqueConstraint, delete, update, Boolean, Text, JSON,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.future import select
@@ -149,6 +149,44 @@ class Vulnerability(Base):
     discovered_at   = Column(DateTime, default=datetime.utcnow)
     matched_at      = Column(DateTime, default=datetime.utcnow)  # kept for compat
     host            = relationship("Host", back_populates="vulnerabilities")
+
+
+class AuditAnalysis(Base):
+    """Stores the scan-level AI or rule-based audit synthesis."""
+    __tablename__ = "audit_analysis"
+    id                = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    scan_id           = Column(String, ForeignKey("scans.id", ondelete="CASCADE"), unique=True, nullable=False)
+    security_score    = Column(Integer, nullable=True)
+    maturity_level    = Column(String, nullable=True)
+    executive_summary = Column(Text, nullable=False, default="")
+    attack_vectors    = Column(JSON, nullable=False, default=list)
+    most_dangerous_vulnerabilities = Column(JSON, nullable=False, default=list)
+    business_impact   = Column(JSON, nullable=False, default=dict)
+    likelihood_of_compromise = Column(String, nullable=True)
+    attacker_scenario = Column(Text, nullable=False, default="")
+    security_strengths = Column(JSON, nullable=False, default=list)
+    security_weaknesses = Column(JSON, nullable=False, default=list)
+    global_risk_conclusion = Column(Text, nullable=False, default="")
+    key_findings      = Column(JSON, nullable=False, default=list)
+    strategic_recommendations = Column(JSON, nullable=False, default=list)
+    overall_verdict   = Column(String, nullable=False, default="")
+    ai_generated      = Column(Boolean, default=False)
+    generated_at      = Column(DateTime, default=datetime.utcnow)
+
+
+class LLMDecisionLog(Base):
+    """Audit trail for every LLM call (success, timeout, error, fallback)."""
+    __tablename__ = "llm_decision_logs"
+    id            = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    scan_id       = Column(String, nullable=True)
+    host_ip       = Column(String, nullable=True)
+    decision_type = Column(String, nullable=True)
+    input_summary = Column(Text, nullable=True)
+    output_summary= Column(Text, nullable=True)
+    status        = Column(String, nullable=True)   # success | timeout | error
+    duration_ms   = Column(Integer, nullable=True)
+    created_at    = Column(DateTime, default=datetime.utcnow)
+
 
 # =============================================================================
 # PYDANTIC SCHEMAS
@@ -849,6 +887,33 @@ async def run_pipeline(scan_id: str, target: str) -> None:
         # Step 4 — atomic DB write
         await persist_results(scan_id, host_results)
 
+        # =====================================================================
+        # 🤖 NEW STAGE: AI AUDIT ANALYSIS
+        # =====================================================================
+        logger.info("[AI ANALYSIS] Generating scan-level audit analysis")
+        try:
+            from services.audit_analysis import generate_audit_analysis, persist_audit_analysis
+            analysis = await generate_audit_analysis(scan_id)
+            if analysis:
+                await persist_audit_analysis(scan_id, analysis)
+                mode = "AI" if analysis.get("ai_generated") else "fallback"
+                logger.info(f"[AI ANALYSIS] Completed ({mode} mode) - keys: {list(analysis.keys())}")
+            else:
+                logger.warning("[AI ANALYSIS] generate_audit_analysis returned None/empty")
+        except Exception as exc:
+            logger.exception(f"[AI ANALYSIS] Failed (non-fatal): {exc}")
+            # Create minimal fallback to ensure analysis exists
+            try:
+                from services.audit_analysis import build_fallback_analysis, build_scan_context, persist_audit_analysis
+                context = await build_scan_context(scan_id)
+                if context:
+                    fallback = build_fallback_analysis(context)
+                    await persist_audit_analysis(scan_id, fallback)
+                    logger.info("[AI ANALYSIS] Fallback analysis persisted as backup")
+            except Exception as fallback_exc:
+                logger.error(f"[AI ANALYSIS] Fallback also failed: {fallback_exc}")
+        # =====================================================================
+
         duration = asyncio.get_event_loop().time() - t0
         logger.info(f"[SCAN DONE] scan_id={scan_id} duration={duration:.1f}s")
 
@@ -1058,6 +1123,7 @@ async def list_scans():
     return [
         {
             "id":          latest_scan.id,
+            "scan_id":     latest_scan.id,
             "target":      latest_scan.target,
             "status":      latest_scan.status,
             "fail_reason": latest_scan.fail_reason,
@@ -1101,6 +1167,37 @@ async def list_scans():
             ]
         }
     ]
+
+
+# ── GET /scan/{scan_id}/analysis ─────────────────────────────────────────────
+@app.get("/scan/{scan_id}/analysis")
+async def get_scan_analysis(scan_id: str):
+    """Returns the AI/rule-based audit analysis for a completed scan."""
+    from services.audit_analysis import fetch_audit_analysis
+    logger.info(f"[ANALYSIS ENDPOINT] Requested analysis for scan_id: {scan_id}")
+    analysis = await fetch_audit_analysis(scan_id)
+    if not analysis:
+        logger.warning(f"[ANALYSIS ENDPOINT] No analysis found for scan_id: {scan_id}")
+        raise HTTPException(status_code=404, detail="Analyse non disponible — le scan est peut-être encore en cours.")
+    logger.info(f"[ANALYSIS ENDPOINT] Analysis found for scan_id: {scan_id}, returning {len(analysis)} fields")
+    return analysis
+
+
+# ── GET /scan/{scan_id}/report.pdf ────────────────────────────────────────────
+@app.get("/scan/{scan_id}/report.pdf")
+async def get_scan_report(scan_id: str):
+    """Generates and streams a polished PDF audit report."""
+    try:
+        from services.pdf_report import generate_pdf_report
+        pdf_bytes = await generate_pdf_report(scan_id)
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=audit_report_{scan_id[:8]}.pdf"},
+        )
+    except Exception as exc:
+        logger.error(f"[PDF] Generation failed for {scan_id}: {exc}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la génération du rapport PDF: {exc}")
 
 
 # ── GET /health ───────────────────────────────────────────────────────────────

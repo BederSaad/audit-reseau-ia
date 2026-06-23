@@ -1,0 +1,55 @@
+.btn-pdf-download {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  background: rgba(79, 70, 229, 0.15); /* Primary violet transparent tint */
+  border: 1px solid rgba(79, 70, 229, 0.4);
+  color: #fff;
+  border-radius: var(--radius-sm);
+  font-weight: 700;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 0 10px rgba(79, 70, 229, 0.1);
+}
+
+.btn-pdf-download:hover:not(:disabled) {
+  background: rgba(79, 70, 229, 0.3);
+  border-color: rgba(79, 70, 229, 0.8);
+  box-shadow: 0 0 15px rgba(79, 70, 229, 0.3);
+  transform: translateY(-1px);
+}
+
+.btn-pdf-download:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.btn-pdf-download:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  background: rgba(255, 255, 255, 0.02);
+  border-color: rgba(255, 255, 255, 0.05);
+  box-shadow: none;
+}
+
+.pdf-btn-icon {
+  font-size: 1.1rem;
+}
+
+/* Spinner */
+.pdf-btn-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.2);
+  border-radius: 50%;
+  border-top-color: #fff;
+  animation: spin 0.8s linear infinite;
+  display: inline-block;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
