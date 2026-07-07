@@ -9,10 +9,13 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -23,7 +26,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # python-dotenv not installed; use environment variables directly
+    pass
 
 # ── 3. Third-party imports ────────────────────────────────────────────────────
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
@@ -40,6 +43,15 @@ from sqlalchemy.orm import declarative_base, relationship, selectinload
 # ── 4. Service module imports ───────────────────────────────────────────────
 from services.credential_testing import run_credential_tests, credential_results_to_vulnerabilities
 from services.cve_enrichment import enrich_vulnerabilities_list
+from services.risk_scoring import calculate_host_risk_score, criticality_from_score
+
+# ── 5. NEW: Evidence capture ─────────────────────────────────────────────────
+from services.evidence_capture import (
+    capture_web_screenshot,
+    capture_host_screenshot,
+    capture_auth_screenshot,
+    capture_credential_text,
+)
 
 # =============================================================================
 # LOGGING
@@ -92,13 +104,13 @@ AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_co
 Base = declarative_base()
 
 # =============================================================================
-# ORM MODELS
+# ORM MODELS (inlined for clarity)
 # =============================================================================
 class Scan(Base):
     __tablename__ = "scans"
     id          = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     target      = Column(String, nullable=False)
-    status      = Column(String, default="running")   # running / done / failed
+    status      = Column(String, default="running")
     fail_reason = Column(String, nullable=True)
     hosts_found = Column(Integer, default=0)
     started_at  = Column(DateTime, default=datetime.utcnow)
@@ -109,16 +121,44 @@ class Scan(Base):
 class Host(Base):
     __tablename__ = "hosts"
     __table_args__ = (UniqueConstraint("scan_id", "ip"),)
-    id          = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    scan_id     = Column(String, ForeignKey("scans.id", ondelete="CASCADE"), nullable=False)
-    ip          = Column(String, nullable=False)
-    hostname    = Column(String, nullable=True)
-    os          = Column(String, nullable=True)
-    mac_address = Column(String, nullable=True)
-    status      = Column(String, default="up")
-    scan            = relationship("Scan", back_populates="hosts")
-    services        = relationship("Service", back_populates="host", cascade="all, delete-orphan")
-    vulnerabilities = relationship("Vulnerability", back_populates="host", cascade="all, delete-orphan")
+    id                = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    scan_id           = Column(String, ForeignKey("scans.id", ondelete="CASCADE"), nullable=False)
+    ip                = Column(String, nullable=False)
+    ipv6              = Column(String, nullable=True)
+    hostname          = Column(String, nullable=True)
+    hostname_source   = Column(String, nullable=True)
+    hostname_confidence = Column(Float, default=0.0)
+    os                = Column(String, nullable=True)
+    os_family         = Column(String, nullable=True)
+    os_version        = Column(String, nullable=True)
+    os_confidence     = Column(String, nullable=True)
+    device_type       = Column(String, nullable=True)
+    device_classification = Column(String, nullable=True)
+    manufacturer      = Column(String, nullable=True)
+    mac_address       = Column(String, nullable=True)
+    mac_vendor        = Column(String, nullable=True)
+    network_interface = Column(String, nullable=True)
+    architecture      = Column(String, nullable=True)
+    uptime            = Column(String, nullable=True)
+    is_gateway        = Column(Boolean, default=False)
+    is_local_machine  = Column(Boolean, default=False)
+    is_vm             = Column(Boolean, default=False)
+    is_docker         = Column(Boolean, default=False)
+    is_wsl            = Column(Boolean, default=False)
+    is_mobile         = Column(Boolean, default=False)
+    scan_type         = Column(String, nullable=True)
+    status            = Column(String, default="up")
+    audit_status      = Column(String, default="pending")
+    last_scan         = Column(DateTime, nullable=True)
+    risk_score        = Column(Float, default=0.0)
+    criticality       = Column(String, default="Unknown")
+    discovery_method  = Column(String, nullable=True)
+    running_applications = Column(JSON, default=list)
+    screenshot_path      = Column(String, nullable=True)
+    evidence             = Column(JSON, default=list)
+    scan              = relationship("Scan", back_populates="hosts")
+    services          = relationship("Service", back_populates="host", cascade="all, delete-orphan")
+    vulnerabilities   = relationship("Vulnerability", back_populates="host", cascade="all, delete-orphan")
 
 
 class Service(Base):
@@ -130,6 +170,7 @@ class Service(Base):
     name     = Column(String, nullable=True)
     version  = Column(String, nullable=True)
     state    = Column(String, default="open")
+    banner   = Column(Text, nullable=True)
     host     = relationship("Host", back_populates="services")
 
 
@@ -143,16 +184,18 @@ class Vulnerability(Base):
     cve_id          = Column(String, nullable=True)
     description     = Column(Text, nullable=True)
     matcher_name    = Column(String, nullable=True)
-    cvss_score      = Column(Float, nullable=True)      # exact float from nuclei or estimated
-    cvss_estimated  = Column(Boolean, default=False)    # True = estimated from severity
-    source          = Column(String, default="nuclei")  # "nuclei" | "nvd"
+    cvss_score      = Column(Float, nullable=True)
+    cvss_estimated  = Column(Boolean, default=False)
+    source          = Column(String, default="nuclei")
     discovered_at   = Column(DateTime, default=datetime.utcnow)
-    matched_at      = Column(DateTime, default=datetime.utcnow)  # kept for compat
+    matched_at      = Column(DateTime, default=datetime.utcnow)
+    remediation     = Column(Text, nullable=True)
+    exploit_available = Column(Boolean, default=False)
+    references      = Column(JSON, default=list)
     host            = relationship("Host", back_populates="vulnerabilities")
 
 
 class AuditAnalysis(Base):
-    """Stores the scan-level AI or rule-based audit synthesis."""
     __tablename__ = "audit_analysis"
     id                = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     scan_id           = Column(String, ForeignKey("scans.id", ondelete="CASCADE"), unique=True, nullable=False)
@@ -175,7 +218,6 @@ class AuditAnalysis(Base):
 
 
 class LLMDecisionLog(Base):
-    """Audit trail for every LLM call (success, timeout, error, fallback)."""
     __tablename__ = "llm_decision_logs"
     id            = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     scan_id       = Column(String, nullable=True)
@@ -183,7 +225,7 @@ class LLMDecisionLog(Base):
     decision_type = Column(String, nullable=True)
     input_summary = Column(Text, nullable=True)
     output_summary= Column(Text, nullable=True)
-    status        = Column(String, nullable=True)   # success | timeout | error
+    status        = Column(String, nullable=True)
     duration_ms   = Column(Integer, nullable=True)
     created_at    = Column(DateTime, default=datetime.utcnow)
 
@@ -211,7 +253,6 @@ class StatusResponse(BaseModel):
 # HELPERS — XML / JSON PARSING
 # =============================================================================
 def _parse_discovery_xml(path: Path) -> set[str]:
-    """Return set of IPs with state=up from a Nmap discovery XML."""
     ips: set[str] = set()
     if not path.exists():
         return ips
@@ -229,11 +270,86 @@ def _parse_discovery_xml(path: Path) -> set[str]:
     return ips
 
 
+def _extract_hostscript_outputs(host_el) -> dict[str, str]:
+    outputs: dict[str, str] = {}
+    for script_el in host_el.findall("hostscript/script"):
+        sid = script_el.get("id")
+        out = script_el.get("output", "")
+        if sid:
+            outputs[sid] = out
+    for script_el in host_el.findall(".//port/script"):
+        sid = script_el.get("id")
+        out = script_el.get("output", "")
+        if sid and sid not in outputs:
+            outputs[sid] = out
+    return outputs
+
+
+def _parse_vulnerabilities_from_nmap_xml(host_el, host_ip: str) -> list[dict]:
+    vulns = []
+    for script_el in host_el.findall("hostscript/script"):
+        sid = script_el.get("id", "")
+        output = script_el.get("output", "")
+        if "vuln" in sid.lower() or "VULNERABLE" in output:
+            vuln = _extract_vuln_from_script_output(sid, output, host_ip)
+            if vuln:
+                vulns.append(vuln)
+    for port_el in host_el.findall(".//port"):
+        for script_el in port_el.findall("script"):
+            sid = script_el.get("id", "")
+            output = script_el.get("output", "")
+            if "vuln" in sid.lower() or "VULNERABLE" in output:
+                vuln = _extract_vuln_from_script_output(sid, output, host_ip)
+                if vuln:
+                    vulns.append(vuln)
+    return vulns
+
+
+def _extract_vuln_from_script_output(script_id: str, output: str, host_ip: str) -> dict | None:
+    cvss_match = re.search(r'CVSS\s+(\d+\.?\d*)', output, re.I)
+    cvss_score = float(cvss_match.group(1)) if cvss_match else None
+
+    severity = "info"
+    if cvss_score is not None:
+        if cvss_score >= 9.0: severity = "critical"
+        elif cvss_score >= 7.0: severity = "high"
+        elif cvss_score >= 4.0: severity = "medium"
+        elif cvss_score > 0: severity = "low"
+    else:
+        if "critical" in output.lower(): severity = "critical"
+        elif "high" in output.lower(): severity = "high"
+        elif "medium" in output.lower(): severity = "medium"
+        elif "low" in output.lower(): severity = "low"
+
+    cve_match = re.search(r'(CVE-\d{4}-\d{4,})', output, re.I)
+    cve_id = cve_match.group(1) if cve_match else None
+
+    name = script_id.replace("_", " ").title()
+    title_match = re.search(r'VULNERABLE:\s*([^\n]+)', output, re.I)
+    if title_match:
+        name = title_match.group(1).strip()
+
+    desc = output.strip()
+    if len(desc) > 500:
+        desc = desc[:500] + "..."
+
+    return {
+        "template_id": script_id,
+        "name": name,
+        "severity": severity,
+        "cve_id": cve_id,
+        "cvss_score": cvss_score,
+        "cvss_estimated": cvss_score is None,
+        "matcher_name": script_id,
+        "description": desc,
+        "source": "nmap_nse",
+        "remediation": "",
+        "exploit_available": False,
+        "references": [],
+    }
+
+
 def _parse_service_xml(path: Path) -> dict | None:
-    """
-    Parse a per-host Nmap service-scan XML.
-    Returns a dict with ip, hostname, os, mac, and services list — or None.
-    """
     if not path.exists():
         return None
     try:
@@ -245,34 +361,58 @@ def _parse_service_xml(path: Path) -> dict | None:
         if st is None or st.get("state") != "up":
             return None
 
-        # IP
+        ttl = None
+        raw_ttl = st.get("reason_ttl")
+        if raw_ttl:
+            try:
+                ttl = int(raw_ttl)
+            except ValueError:
+                ttl = None
+
         ip = ""
+        ipv6 = None
         mac = None
+        mac_vendor = None
         for addr_el in host_el.findall("address"):
-            if addr_el.get("addrtype") == "ipv4":
+            atype = addr_el.get("addrtype")
+            if atype == "ipv4":
                 ip = addr_el.get("addr", "")
-            elif addr_el.get("addrtype") == "mac":
+            elif atype == "ipv6":
+                ipv6 = addr_el.get("addr")
+            elif atype == "mac":
                 mac = addr_el.get("addr")
+                mac_vendor = addr_el.get("vendor") or None
         if not ip:
             return None
 
-        # Hostname (PTR preferred)
         hostname = None
         for hn in host_el.findall("hostnames/hostname"):
+            name = hn.get("name")
+            if not name:
+                continue
             if hn.get("type") == "PTR":
-                hostname = hn.get("name")
+                hostname = name
                 break
-            hostname = hn.get("name")  # fallback: first found
+            if hostname is None:
+                hostname = name
 
-        # OS (accuracy >= 50%)
         os_name = None
+        os_accuracy = 0
         for osm in host_el.findall("os/osmatch"):
-            if int(osm.get("accuracy", "0")) >= 50:
+            try:
+                accuracy = int(osm.get("accuracy", "0"))
+            except ValueError:
+                accuracy = 0
+            if accuracy >= 50 and accuracy > os_accuracy:
                 os_name = osm.get("name")
-                break
+                os_accuracy = accuracy
 
-        # Open ports / services
+        uptime = None
+        for ut_el in host_el.findall("uptime"):
+            uptime = ut_el.get("lastboot")
+
         services = []
+        running_apps = []
         for port_el in host_el.findall(".//port"):
             st_el = port_el.find("state")
             if st_el is None or st_el.get("state") != "open":
@@ -280,22 +420,51 @@ def _parse_service_xml(path: Path) -> dict | None:
             svc_el = port_el.find("service")
             product = svc_el.get("product", "") if svc_el is not None else ""
             version = svc_el.get("version", "") if svc_el is not None else ""
+            extrainfo = svc_el.get("extrainfo", "") if svc_el is not None else ""
+            banner = f"{product} {version} {extrainfo}".strip()
+            svc_name = svc_el.get("name") if svc_el is not None else None
+
             services.append({
                 "port":     int(port_el.get("portid", 0)),
                 "protocol": port_el.get("protocol", "tcp"),
-                "name":     svc_el.get("name") if svc_el is not None else None,
+                "name":     svc_name,
                 "version":  f"{product} {version}".strip() or None,
                 "state":    "open",
+                "banner":   banner or None,
             })
 
-        return {"ip": ip, "hostname": hostname, "os": os_name, "mac": mac, "services": services}
+            if product:
+                running_apps.append({
+                    "name": product,
+                    "version": version or "Unknown",
+                    "port": int(port_el.get("portid", 0)),
+                    "protocol": port_el.get("protocol", "tcp"),
+                })
+
+        hostscripts = _extract_hostscript_outputs(host_el)
+        nse_vulns = _parse_vulnerabilities_from_nmap_xml(host_el, ip)
+
+        return {
+            "ip": ip,
+            "ipv6": ipv6,
+            "hostname": hostname,
+            "os": os_name,
+            "os_accuracy": os_accuracy,
+            "mac": mac,
+            "mac_vendor": mac_vendor,
+            "uptime": uptime,
+            "ttl": ttl,
+            "hostscripts": hostscripts,
+            "services": services,
+            "running_applications": running_apps,
+            "nse_vulns": nse_vulns,
+        }
     except Exception as exc:
         logger.warning(f"Service XML parse error ({path}): {exc}")
         return None
 
 
 def _get_mac_from_arp(ip: str) -> str | None:
-    """Natively resolve MAC address from Windows ARP table if Nmap misses it."""
     try:
         output = subprocess.check_output(["arp", "-a", ip], text=True, creationflags=0x08000000)
         for line in output.splitlines():
@@ -307,39 +476,565 @@ def _get_mac_from_arp(ip: str) -> str | None:
         pass
     return None
 
-import socket
-import re as _re
 
-# Severity → estimated CVSS score when the tool doesn't provide one
+def snapshot_arp_table() -> dict[str, str]:
+    table: dict[str, str] = {}
+    try:
+        output = subprocess.check_output(["arp", "-a"], text=True, creationflags=0x08000000)
+        for line in output.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and "-" in parts[1]:
+                ip_candidate = parts[0]
+                try:
+                    ipaddress.IPv4Address(ip_candidate)
+                except ValueError:
+                    continue
+                table[ip_candidate] = parts[1].replace("-", ":").upper()
+    except Exception as exc:
+        logger.warning(f"ARP table snapshot failed: {exc}")
+    return table
+
+
+# =============================================================================
+# MAC VENDOR LOOKUP
+# =============================================================================
+try:
+    from mac_vendor_lookup import AsyncMacLookup
+    _mac_lookup = AsyncMacLookup()
+    _MAC_LOOKUP_AVAILABLE = True
+except ImportError:
+    _mac_lookup = None
+    _MAC_LOOKUP_AVAILABLE = False
+    logger.warning("mac-vendor-lookup not installed — MAC vendor guesses will be skipped.")
+
+_mac_vendor_db_ready = False
+
+async def ensure_mac_vendor_db_loaded() -> None:
+    global _mac_vendor_db_ready
+    if not _MAC_LOOKUP_AVAILABLE or _mac_vendor_db_ready:
+        return
+    try:
+        await _mac_lookup.load_vendors()
+        _mac_vendor_db_ready = True
+        logger.info("MAC vendor database (IEEE OUI) loaded")
+    except Exception as exc:
+        logger.warning(f"MAC vendor DB load failed: {exc}")
+
+async def guess_vendor_from_mac(mac: str | None) -> str | None:
+    if not mac or not _MAC_LOOKUP_AVAILABLE or not _mac_vendor_db_ready:
+        return None
+    try:
+        return await _mac_lookup.lookup(mac)
+    except Exception:
+        return None
+
+
+PRIVATE_MAC_LABEL = "Private/Randomized (vendor hidden by device)"
+
+
+def _is_locally_administered_mac(mac: str | None) -> bool:
+    if not mac:
+        return False
+    try:
+        first_octet = mac.replace("-", ":").split(":")[0]
+        val = int(first_octet, 16)
+        return bool(val & 0b00000010)
+    except Exception:
+        return False
+
+
+# =============================================================================
+# LOCAL INTERFACE MAC DETECTION
+# =============================================================================
+try:
+    import psutil
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    psutil = None
+    _PSUTIL_AVAILABLE = False
+
+def get_local_interface_macs() -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    if not _PSUTIL_AVAILABLE:
+        return mapping
+    try:
+        addrs = psutil.net_if_addrs()
+        for iface_addrs in addrs.values():
+            mac = None
+            ips: list[str] = []
+            for a in iface_addrs:
+                if a.family == socket.AF_INET:
+                    ips.append(a.address)
+                else:
+                    addr_str = a.address or ""
+                    if len(addr_str) in (17, 12) and (":" in addr_str or "-" in addr_str):
+                        mac = addr_str.upper().replace("-", ":")
+            if mac:
+                for ip in ips:
+                    mapping[ip] = mac
+    except Exception as exc:
+        logger.debug(f"Could not enumerate local interfaces: {exc}")
+    return mapping
+
+
+def _resolve_hostname_via_dns(ip: str, timeout: float = 3.0) -> str | None:
+    old_timeout = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(timeout)
+        hn = socket.gethostbyaddr(ip)
+        return hn[0] if hn and hn[0] else None
+    except Exception:
+        return None
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
+
+# =============================================================================
+# ACTIVE mDNS DISCOVERY
+# =============================================================================
+try:
+    from zeroconf import Zeroconf, ServiceBrowser, ServiceListener
+    _ZEROCONF_AVAILABLE = True
+except ImportError:
+    Zeroconf = ServiceBrowser = ServiceListener = None
+    _ZEROCONF_AVAILABLE = False
+
+_MDNS_SERVICE_TYPES = [
+    "_device-info._tcp.local.",
+    "_airplay._tcp.local.",
+    "_companion-link._tcp.local.",
+    "_rdlink._tcp.local.",
+    "_http._tcp.local.",
+    "_ipp._tcp.local.",
+    "_workstation._tcp.local.",
+    "_smb._tcp.local.",
+]
+
+def snapshot_mdns_names(wait_seconds: float = 4.0) -> dict[str, str]:
+    if not _ZEROCONF_AVAILABLE:
+        return {}
+
+    results: dict[str, str] = {}
+
+    class _Listener(ServiceListener):
+        def add_service(self, zc, service_type, name):
+            try:
+                info = zc.get_service_info(service_type, name, timeout=1500)
+                if info and info.addresses:
+                    device_name = (info.server or name).rstrip(".")
+                    for raw in info.addresses:
+                        try:
+                            ip = socket.inet_ntoa(raw)
+                        except Exception:
+                            continue
+                        results.setdefault(ip, device_name)
+            except Exception:
+                pass
+
+        def update_service(self, zc, service_type, name):
+            pass
+
+        def remove_service(self, zc, service_type, name):
+            pass
+
+    zc = None
+    try:
+        zc = Zeroconf()
+        listener = _Listener()
+        browsers = [ServiceBrowser(zc, st, listener) for st in _MDNS_SERVICE_TYPES]
+        time.sleep(wait_seconds)
+    except Exception as exc:
+        logger.warning(f"mDNS snapshot failed: {exc}")
+    finally:
+        if zc is not None:
+            try:
+                zc.close()
+            except Exception:
+                pass
+
+    return results
+
+
+# =============================================================================
+# INTELLIGENCE & CLASSIFICATION ENGINE
+# =============================================================================
+
+def _get_default_gateway() -> str | None:
+    try:
+        if sys.platform == "win32":
+            output = subprocess.check_output(["ipconfig"], text=True, creationflags=0x08000000)
+            for line in output.splitlines():
+                if "Default Gateway" in line:
+                    parts = line.split(":")
+                    if len(parts) >= 2:
+                        gw = parts[1].strip()
+                        try:
+                            ipaddress.IPv4Address(gw)
+                            return gw
+                        except ValueError:
+                            continue
+        else:
+            output = subprocess.check_output(["ip", "route"], text=True)
+            for line in output.splitlines():
+                if "default" in line:
+                    parts = line.split()
+                    for p in parts:
+                        try:
+                            ipaddress.IPv4Address(p)
+                            return p
+                        except ValueError:
+                            continue
+    except Exception:
+        pass
+    return None
+
+
+def _get_local_ips() -> set[str]:
+    ips = set()
+    if not _PSUTIL_AVAILABLE:
+        try:
+            hn = socket.gethostname()
+            ips.add(socket.gethostbyname(hn))
+        except Exception:
+            pass
+        return ips
+    try:
+        for iface_addrs in psutil.net_if_addrs().values():
+            for a in iface_addrs:
+                if a.family == socket.AF_INET:
+                    ips.add(a.address)
+    except Exception:
+        pass
+    return ips
+
+
+def _infer_os_from_ttl(ttl: int | None, mac_vendor: str | None) -> str | None:
+    if ttl is None:
+        return None
+    if 110 <= ttl <= 128:
+        return "Windows (inferred from ICMP TTL)"
+    if 50 <= ttl <= 64:
+        if mac_vendor and "apple" in mac_vendor.lower():
+            return "iOS / macOS — Apple device (inferred from ICMP TTL + MAC vendor)"
+        return "Linux / Android / Unix-like (inferred from ICMP TTL)"
+    if 200 <= ttl <= 255:
+        return "Network appliance / embedded Unix (inferred from ICMP TTL)"
+    return None
+
+
+def _infer_os_from_ports(ports: list[int]) -> str | None:
+    port_set = set(ports)
+    windows_ports = {135, 139, 445, 3389}
+    linux_ports = {22}
+    macos_ports = {548, 5000, 7000}
+    if port_set & windows_ports:
+        return "Windows (inferred from SMB/RDP ports)"
+    if port_set & macos_ports and not (port_set & windows_ports):
+        return "macOS (inferred from AFP/Bonjour ports)"
+    if port_set & linux_ports:
+        return "Linux/Unix (inferred from SSH port)"
+    return None
+
+
+def parse_os_details(os_name: str | None) -> tuple[str | None, str | None, str | None]:
+    if not os_name:
+        return None, None, None
+
+    os_lower = os_name.lower()
+    family = "Unknown"
+    version = None
+
+    if "windows" in os_lower:
+        family = "Windows"
+        m = re.search(r'windows\s+(xp|vista|7|8|8\.1|10|11|2000|2003|2008|2012|2016|2019|2022|nt)', os_lower)
+        if m:
+            version = m.group(1).upper() if m.group(1) in ['nt', 'xp'] else m.group(1)
+    elif "linux" in os_lower or "ubuntu" in os_lower or "debian" in os_lower or "fedora" in os_lower or "centos" in os_lower or "red hat" in os_lower or "arch" in os_lower or "kali" in os_lower:
+        family = "Linux"
+        m = re.search(r'ubuntu[\s\/]([\d\.]+)', os_lower)
+        if m:
+            version = m.group(1)
+        else:
+            m = re.search(r'centos[\s\/]([\d\.]+)', os_lower)
+            if m:
+                version = m.group(1)
+    elif "macos" in os_lower or "os x" in os_lower or "mac os" in os_lower:
+        family = "macOS"
+        m = re.search(r'(\d+\.\d+)', os_name)
+        if m:
+            version = m.group(1)
+    elif "ios" in os_lower and "cisco" not in os_lower:
+        family = "iOS"
+        m = re.search(r'(\d+\.\d+)', os_name)
+        if m:
+            version = m.group(1)
+    elif "android" in os_lower:
+        family = "Android"
+        m = re.search(r'(\d+\.\d+)', os_name)
+        if m:
+            version = m.group(1)
+    elif "freebsd" in os_lower or "openbsd" in os_lower or "netbsd" in os_lower:
+        family = "BSD"
+    elif "cisco" in os_lower:
+        family = "Cisco IOS"
+    elif "mikrotik" in os_lower or "routeros" in os_lower:
+        family = "MikroTik RouterOS"
+    elif "openwrt" in os_lower:
+        family = "OpenWRT"
+    elif "pfsense" in os_lower or "freebsd" in os_lower:
+        family = "pfSense/FreeBSD"
+    elif "synology" in os_lower:
+        family = "Synology DSM"
+    elif "truenas" in os_lower or "freenas" in os_lower:
+        family = "TrueNAS"
+
+    return family, version, os_name
+
+
+def detect_vm_docker_wsl(mac_vendor: str | None, hostscripts: dict, services: list, hostname: str | None) -> tuple[bool, bool, bool]:
+    is_vm = False
+    is_docker = False
+    is_wsl = False
+
+    hname = (hostname or "").lower()
+    mv = (mac_vendor or "").lower()
+
+    vm_vendors = ["vmware", "virtualbox", "parallels", "xen", "qemu", "red hat", "microsoft hyper-v", "citrix"]
+    for v in vm_vendors:
+        if v in mv:
+            is_vm = True
+            break
+
+    docker_ports = {2375, 2376, 2377}
+    for s in services:
+        if s.get("port") in docker_ports:
+            is_docker = True
+        if "docker" in (s.get("name") or "").lower():
+            is_docker = True
+
+    if "docker" in hname:
+        is_docker = True
+
+    if "wsl" in hname or "microsoft" in mv:
+        linux_ports = {22, 80}
+        has_linux = any(s.get("port") in linux_ports for s in services)
+        if has_linux and not is_vm:
+            is_wsl = True
+
+    for sid, output in hostscripts.items():
+        out_lower = output.lower()
+        if "vmware" in out_lower or "virtual machine" in out_lower:
+            is_vm = True
+        if "docker" in out_lower:
+            is_docker = True
+
+    return is_vm, is_docker, is_wsl
+
+
+def classify_device(
+    os_name: str | None, os_family: str | None, mac_vendor: str | None,
+    services: list, hostname: str | None, is_vm: bool, is_docker: bool, is_wsl: bool
+) -> tuple[str, str]:
+    hname = (hostname or "").lower()
+    mv = (mac_vendor or "").lower()
+    ports = {s.get("port") for s in services}
+
+    if is_docker:
+        return "Container", "Docker Container"
+    if is_wsl:
+        return "VM", "WSL Instance"
+    if is_vm:
+        return "VM", "Virtual Machine"
+
+    if mv == PRIVATE_MAC_LABEL.lower() and not ports and (not os_name or os_name == "Unknown"):
+        return "Mobile", "Likely Mobile/IoT Device (Private, Randomized MAC)"
+
+    printer_ports = {515, 631, 9100, 9290}
+    if ports & printer_ports or "printer" in hname or "canon" in mv or "hp" in mv or "epson" in mv or "xerox" in mv:
+        if "canon" in mv:
+            return "Printer", "Canon Printer"
+        if "hp" in mv or "hewlett" in mv:
+            return "Printer", "HP Printer"
+        return "Printer", "Network Printer"
+
+    nas_ports = {5000, 5001, 8200, 111, 2049}
+    if ports & nas_ports or "synology" in hname or "synology" in mv or "qnap" in hname or "qnap" in mv or "nas" in hname:
+        if "synology" in hname or "synology" in mv:
+            return "NAS", "Synology NAS"
+        if "qnap" in hname or "qnap" in mv:
+            return "NAS", "QNAP NAS"
+        return "NAS", "Network Attached Storage"
+
+    if "camera" in hname or "cam" in hname or "hikvision" in mv or "dahua" in mv or "axis" in mv:
+        return "Camera", "IP Camera"
+
+    if "tv" in hname or "samsung" in mv or "lg" in mv or "roku" in mv or "chromecast" in hname:
+        if "samsung" in mv or "samsung" in hname:
+            return "TV", "Samsung Smart TV"
+        if "lg" in mv:
+            return "TV", "LG Smart TV"
+        return "TV", "Smart TV / Media Player"
+
+    if "iphone" in hname or "ipad" in hname or "apple" in mv:
+        if "ipad" in hname:
+            return "Tablet", "Apple iPad"
+        return "Phone", "Apple iPhone"
+    if "android" in hname or "samsung" in mv or "google" in mv or "pixel" in hname:
+        if "tablet" in hname or "tab" in hname:
+            return "Tablet", "Android Tablet"
+        return "Phone", "Android Phone"
+
+    router_ports = {53, 80, 443, 8080, 8443}
+    if ports & {53, 67, 68} or "router" in hname or "gateway" in hname or "tplink" in mv or "netgear" in mv or "asus" in mv or "linksys" in mv or "cisco" in mv or "mikrotik" in mv or "ubiquiti" in mv:
+        if "mikrotik" in mv or "mikrotik" in hname:
+            return "Router", "MikroTik Router"
+        if "ubiquiti" in mv:
+            return "Router", "Ubiquiti Access Point / Router"
+        if "cisco" in mv:
+            return "Router", "Cisco Network Device"
+        return "Router", "Router / Gateway / Firewall"
+
+    if "switch" in hname or "netgear" in mv:
+        return "Switch", "Network Switch"
+
+    if "iot" in hname or "esp" in hname or "arduino" in hname or "raspberry" in hname:
+        if "raspberry" in hname or "raspberry" in mv:
+            return "IoT", "Raspberry Pi"
+        return "IoT", "IoT / Embedded Device"
+
+    if os_family == "Windows":
+        server_ports = {53, 88, 135, 389, 443, 445, 593, 636, 3268, 3269, 9389}
+        if ports & server_ports:
+            return "Server", "Windows Server"
+        return "Workstation", "Windows Workstation"
+
+    if os_family == "Linux":
+        server_indicators = {53, 111, 2049, 3306, 5432, 6379, 8080, 8443, 9090}
+        if ports & server_indicators or "server" in hname:
+            return "Server", "Linux Server"
+        return "Workstation", "Linux Workstation"
+
+    if os_family == "macOS":
+        if "macbook" in hname or "imac" in hname or "macmini" in hname:
+            return "Workstation", "Apple Mac"
+        return "Workstation", "macOS Device"
+
+    if len(ports) > 15:
+        return "Server", "Multi-Service Server"
+    if len(ports) > 0:
+        return "Workstation", "General Purpose Host"
+
+    return "Unknown", "Unknown Device"
+
+
+async def resolve_os_multi(
+    os_name: str | None, os_accuracy: int, hostscripts: dict, open_ports: list[int],
+    mac_vendor: str | None = None, ttl: int | None = None,
+) -> tuple[str, str, str | None, str | None]:
+    family, version, clean_name = parse_os_details(os_name)
+
+    if os_name and os_accuracy >= 85:
+        return os_name, "confirmed", family, version
+
+    smb_output = hostscripts.get("smb-os-discovery")
+    if smb_output:
+        m = re.search(r"OS:\s*([^\r\n]+)", smb_output)
+        if m:
+            smb_os = m.group(1).strip()
+            f, v, _ = parse_os_details(smb_os)
+            return smb_os, "confirmed", f, v
+
+    if os_name:
+        return os_name, "inferred", family, version
+
+    inferred = _infer_os_from_ports(open_ports)
+    if inferred:
+        f, v, _ = parse_os_details(inferred)
+        return inferred, "inferred", f, v
+
+    ttl_guess = _infer_os_from_ttl(ttl, mac_vendor)
+    if ttl_guess:
+        f, v, _ = parse_os_details(ttl_guess)
+        return ttl_guess, "inferred", f, v
+
+    if mac_vendor:
+        clean_vendor = mac_vendor.split(",")[0].strip()
+        return f"{clean_vendor} device (inferred from MAC vendor)", "inferred", "Unknown", None
+
+    return "Unknown", "unknown", "Unknown", None
+
+
+HOSTNAME_CONFIDENCE = {
+    "ptr": 0.75,
+    "netbios": 0.80,
+    "smb": 0.85,
+    "mdns": 0.70,
+    "ssh": 0.65,
+    "http": 0.60,
+    "unknown": 0.0,
+}
+
+def resolve_hostname_multi(
+    ip: str, nmap_hostname: str | None, hostscripts: dict, mdns_names: dict[str, str] | None = None,
+) -> tuple[str, str, float]:
+    if nmap_hostname:
+        return nmap_hostname, "ptr", HOSTNAME_CONFIDENCE["ptr"]
+
+    nbstat_output = hostscripts.get("nbstat")
+    if nbstat_output:
+        m = re.search(r"NetBIOS name:\s*([^,\r\n]+)", nbstat_output)
+        if m:
+            return m.group(1).strip(), "netbios", HOSTNAME_CONFIDENCE["netbios"]
+
+    smb_output = hostscripts.get("smb-os-discovery")
+    if smb_output:
+        m = re.search(r"Computer name:\s*([^\r\n]+)", smb_output)
+        if m:
+            return m.group(1).strip(), "smb", HOSTNAME_CONFIDENCE["smb"]
+
+    mdns_name = (mdns_names or {}).get(ip)
+    if mdns_name:
+        return mdns_name, "mdns", HOSTNAME_CONFIDENCE["mdns"]
+
+    ssh_output = hostscripts.get("ssh-hostkey")
+    if ssh_output:
+        m = re.search(r"Host:\s*([^\s\r\n]+)", ssh_output)
+        if m:
+            return m.group(1).strip(), "ssh", HOSTNAME_CONFIDENCE["ssh"]
+
+    http_title = hostscripts.get("http-title")
+    if http_title:
+        clean = http_title.strip().split("\n")[0][:30]
+        if clean and clean != "Site doesn't have a title":
+            return clean, "http", HOSTNAME_CONFIDENCE["http"]
+
+    dns_name = _resolve_hostname_via_dns(ip)
+    if dns_name:
+        return dns_name, "ptr", HOSTNAME_CONFIDENCE["ptr"]
+
+    return "Unknown", "unknown", 0.0
+
+
+import ctypes
+
 _SEVERITY_CVSS = {"critical": 9.5, "high": 7.5, "medium": 5.0, "low": 2.5, "info": 0.5}
 
 def extract_cve_from_template_id(template_id: str) -> str | None:
-    """If template-id matches 'cve-YYYY-NNNNN', return normalised 'CVE-YYYY-NNNNN'."""
     if not template_id:
         return None
-    m = _re.fullmatch(r'(?i)cve-(\d{4})-(\d+)', template_id.strip())
+    m = re.fullmatch(r'(?i)cve-(\d{4})-(\d+)', template_id.strip())
     if m:
         return f"CVE-{m.group(1)}-{m.group(2)}"
     return None
 
 
 def compute_health_score(all_vulns: list[dict]) -> int:
-    """Network health score: 100 - weighted risk, clamped [0, 100].
-    Weights: critical=10, high=6, medium=3, low=1, info=0
-    """
     weights = {"critical": 10, "high": 6, "medium": 3, "low": 1, "info": 0}
     risk = sum(weights.get((v.get("severity") or "info").lower(), 0) for v in all_vulns)
     return max(0, 100 - risk)
 
 
 def _parse_nuclei_jsonl(path: Path) -> list[dict]:
-    """Parse Nuclei JSONL file — one JSON object per line.
-    Fixes applied:
-    - cve_id extracted from template-id when classification.cve-id is absent
-    - matcher_name falls back to template-id ('default' as last resort)
-    - cvss_score extracted from classification, or estimated from severity
-    - cvss_estimated flag set True when score is estimated
-    """
     vulns = []
     if not path.exists():
         return vulns
@@ -355,13 +1050,11 @@ def _parse_nuclei_jsonl(path: Path) -> list[dict]:
                 template_id  = data.get("template-id", "") or ""
                 severity     = (info.get("severity") or "info").lower()
 
-                # ── CVE ID: prefer classification list, fall back to template-id pattern
                 cve_list = classification.get("cve-id") or []
                 cve_from_class = cve_list[0] if cve_list else None
                 cve_from_tmpl  = extract_cve_from_template_id(template_id)
-                cve_id = cve_from_class or cve_from_tmpl  # None only if neither matches
+                cve_id = cve_from_class or cve_from_tmpl
 
-                # ── CVSS score: try tool-provided, else estimate from severity
                 raw_cvss = classification.get("cvss-score")
                 if raw_cvss is not None:
                     try:
@@ -374,12 +1067,18 @@ def _parse_nuclei_jsonl(path: Path) -> list[dict]:
                     cvss_score     = _SEVERITY_CVSS.get(severity, 0.5)
                     cvss_estimated = True
 
-                # ── matcher_name: explicit field → template-id → 'default'
                 matcher_name = (
                     data.get("matcher-name")
                     or template_id
                     or "default"
                 )
+
+                refs = []
+                if classification.get("cwe-id"):
+                    refs.append(f"CWE-{classification['cwe-id'][0]}" if isinstance(classification['cwe-id'], list) else f"CWE-{classification['cwe-id']}")
+
+                tags = info.get("tags", [])
+                exploit_available = any(t in str(tags).lower() for t in ["rce", "exploit", "cve"])
 
                 vulns.append({
                     "template_id":    template_id,
@@ -391,21 +1090,35 @@ def _parse_nuclei_jsonl(path: Path) -> list[dict]:
                     "cvss_score":     cvss_score,
                     "cvss_estimated": cvss_estimated,
                     "source":         "nuclei",
+                    "remediation":    info.get("remediation") or "",
+                    "exploit_available": exploit_available,
+                    "references":     refs,
                 })
             except json.JSONDecodeError as exc:
                 logger.warning(f"Nuclei JSONL parse error: {exc}")
     return vulns
 
 # =============================================================================
-# SEMAPHORE — cap concurrent host operations
+# SEMAPHORE
 # =============================================================================
-_sem = asyncio.Semaphore(10)
+_sem = asyncio.Semaphore(15)
+
+# =============================================================================
+# NMAP SCRIPT SETS
+# =============================================================================
+# Full script set used for ALL hosts (deep scan)
+NMAP_SCRIPT_SET = (
+    "default,discovery,auth,vuln,banner,"
+    "http-*,ssl-*,ftp-anon,"
+    "smb-os-discovery,smb-enum-shares,nbstat,snmp-info,"
+    "ssh-hostkey,ssh-brute,dns-service-discovery,"
+    "upnp-info,nbstat,smb-security-mode"
+)
 
 # =============================================================================
 # PIPELINE STEPS
 # =============================================================================
 
-# ── Step 1a: single Nmap discovery probe ──────────────────────────────────────
 async def _run_discovery_probe(target: str, flags: list[str]) -> set[str]:
     tmp = Path(tempfile.mktemp(suffix=".xml"))
     try:
@@ -422,35 +1135,28 @@ async def _run_discovery_probe(target: str, flags: list[str]) -> set[str]:
         tmp.unlink(missing_ok=True)
 
 
-# ── Step 1b: Windows native ARP cache (Fallback) ─────────────────────────────
 async def _ping_host(ip: str):
-    """Native Windows ping to force OS ARP resolution."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "ping", "-n", "1", "-w", "500", ip,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
-            creationflags=0x08000000  # CREATE_NO_WINDOW
+            creationflags=0x08000000
         )
         await proc.wait()
     except Exception:
         pass
 
 async def run_arp_cache_discovery(target: str) -> set[str]:
-    """Reads the Windows ARP cache after forcefully populating it."""
     live_ips = set()
     try:
         net = ipaddress.ip_network(target, strict=False)
-        
-        # 1. Force populate ARP cache by pinging every IP natively
-        if net.prefixlen >= 23: # Prevent overloading on massive subnets
+        if net.prefixlen >= 23:
             logger.info(f"[DISCOVERY] Running native ping sweep on {net.num_addresses} addresses to populate ARP cache...")
             tasks = [_ping_host(str(ip)) for ip in net.hosts()]
-            # Batch concurrent pings to avoid crashing Windows subprocess limits
             for i in range(0, len(tasks), 50):
                 await asyncio.gather(*tasks[i:i+50])
 
-        # 2. Read the resulting ARP cache
         output = await asyncio.to_thread(subprocess.check_output, ["arp", "-a"], text=True)
         for line in output.splitlines():
             parts = line.strip().split()
@@ -467,22 +1173,15 @@ async def run_arp_cache_discovery(target: str) -> set[str]:
     return live_ips
 
 
-# ── Step 1c: 4-layer parallel host discovery ─────────────────────────────────
 async def discover_hosts(target: str) -> set[str]:
-    # Run all probes in parallel. Nmap will trigger network traffic that populates the OS ARP cache,
-    # and the ARP cache layer will read it natively (bypassing Nmap's Admin/Npcap requirements).
     results = await asyncio.gather(
-        # Layer 1 — ARP (fastest, LAN only)
         _run_discovery_probe(target, ["-sn", "-PR", "-T5", "--min-parallelism", "100", "--max-retries", "1"]),
-        # Layer 2 — ICMP echo and timestamp (cross-subnet)
         _run_discovery_probe(target, ["-sn", "-PE", "-PP", "-T4", "--min-parallelism", "50", "--max-retries", "1"]),
-        # Layer 3 — TCP SYN on common ports (catches ICMP-blocked hosts)
         _run_discovery_probe(target, ["-sn", "-PS21,22,23,80,443,3389,8080", "-T4", "--min-parallelism", "50", "--max-retries", "1"]),
-        # Layer 4 — Windows native ARP cache
         run_arp_cache_discovery(target),
         return_exceptions=True
     )
-    
+
     layer1 = results[0] if isinstance(results[0], set) else set()
     layer2 = results[1] if isinstance(results[1], set) else set()
     layer3 = results[2] if isinstance(results[2], set) else set()
@@ -492,136 +1191,164 @@ async def discover_hosts(target: str) -> set[str]:
     logger.info(f"[DISCOVERY] Layer 2 (Nmap ICMP): {len(layer2)} hosts")
     logger.info(f"[DISCOVERY] Layer 3 (Nmap TCP): {len(layer3)} hosts")
     logger.info(f"[DISCOVERY] Layer 4 (OS ARP Cache): {len(layer4)} hosts")
-    
+
     all_ips = layer1 | layer2 | layer3 | layer4
     logger.info(f"[DISCOVERY] Total unique live hosts: {len(all_ips)}")
     return all_ips
 
 
-import ctypes
-
 def is_admin() -> bool:
-    """Check if the current process has Administrator privileges."""
     try:
         return ctypes.windll.shell32.IsUserAnAdmin() == 1
     except Exception:
         return False
 
-# ── Step 2: deep service scan per host ───────────────────────────────────────
-async def service_scan_host(ip: str) -> dict | None:
+
+async def _enrich_host_result(
+    result: dict, ip: str, arp_snapshot: dict[str, str] | None,
+    mdns_names: dict[str, str] | None, gateway_ip: str | None, local_ips: set[str] | None,
+) -> dict:
+    open_ports = [s["port"] for s in result.get("services", [])]
+
+    if not result.get("mac"):
+        result["mac"] = (arp_snapshot or {}).get(ip) or await asyncio.to_thread(_get_mac_from_arp, ip)
+    if not result.get("mac_vendor"):
+        result["mac_vendor"] = await guess_vendor_from_mac(result.get("mac"))
+    if not result.get("mac_vendor") and _is_locally_administered_mac(result.get("mac")):
+        result["mac_vendor"] = PRIVATE_MAC_LABEL
+
+    hostname, hostname_source, hostname_confidence = resolve_hostname_multi(
+        ip, result.get("hostname"), result.get("hostscripts", {}), mdns_names
+    )
+    result["hostname"] = hostname
+    result["hostname_source"] = hostname_source
+    result["hostname_confidence"] = hostname_confidence
+
+    os_name, os_confidence, os_family, os_version = await resolve_os_multi(
+        result.get("os"), result.get("os_accuracy", 0),
+        result.get("hostscripts", {}), open_ports,
+        result.get("mac_vendor"), result.get("ttl"),
+    )
+    result["os"] = os_name
+    result["os_confidence"] = os_confidence
+    result["os_family"] = os_family
+    result["os_version"] = os_version
+
+    is_vm, is_docker, is_wsl = detect_vm_docker_wsl(
+        result.get("mac_vendor"), result.get("hostscripts", {}),
+        result.get("services", []), hostname
+    )
+    result["is_vm"] = is_vm
+    result["is_docker"] = is_docker
+    result["is_wsl"] = is_wsl
+
+    dev_type, dev_class = classify_device(
+        os_name, os_family, result.get("mac_vendor"),
+        result.get("services", []), hostname, is_vm, is_docker, is_wsl
+    )
+    result["device_type"] = dev_type
+    result["device_classification"] = dev_class
+    result["manufacturer"] = result.get("mac_vendor") or "Unknown"
+
+    result["is_gateway"] = (gateway_ip is not None and ip == gateway_ip)
+    result["is_local_machine"] = (local_ips is not None and ip in local_ips)
+
+    return result
+
+
+async def service_scan_host(ip: str, arp_snapshot: dict[str, str] | None = None,
+                           mdns_names: dict[str, str] | None = None,
+                           gateway_ip: str | None = None, local_ips: set[str] | None = None,
+                           attempt: int = 1, max_attempts: int = 2) -> dict | None:
+    """
+    EXTREME DEEP scan for ALL hosts.
+    Scans ALL 65535 ports, uses -A, and is very aggressive.
+    No hard timeout on the subprocess – Nmap's --host-timeout is set to 60 minutes.
+    """
     async with _sem:
-        logger.info(f"[SERVICE SCAN] Starting → {ip}")
+        logger.info(f"[SERVICE SCAN - EXTREME] Starting EXTREME scan → {ip} (attempt {attempt}/{max_attempts})")
         t0 = asyncio.get_event_loop().time()
         tmp = Path(tempfile.mktemp(suffix=f"_{ip.replace('.','_')}.xml"))
         try:
+            # Build the most aggressive Nmap command possible
             cmd = [
                 NMAP_PATH,
-                "-Pn",               # force scan (skip host discovery, assume UP)
-                "-sV",               # service version detection
-                "-T4",               # aggressive but reliable timing
-                "-F",                # fast mode — top 100 ports (quicker than -p-)
-                "--open",            # only show open ports
-                "--min-parallelism", "100",
-                "--max-retries", "1",
+                "-Pn",           # Treat all hosts as up
+                "-sS",           # SYN stealth scan (faster)
+                "-sV",           # Version detection
+                "--version-all", # Try all version probes
+                "-A",            # OS detection, traceroute, and script scan
+                "-p-",           # ALL 65535 ports
+                "--min-rate", "100",   # Minimum packet rate
+                "--max-retries", "2",
+                "--min-parallelism", "50",
+                "--script", NMAP_SCRIPT_SET,
+                "--script-timeout", "5m",
+                "-T4",           # Aggressive timing
+                "--open",        # Only show open ports
+                "--host-timeout", "60m",   # 1 hour per host – you can increase or remove
                 "-oX", str(tmp),
                 ip,
             ]
-            
-            # OS Detection strictly requires Administrator privileges on Windows.
-            # If not admin, Nmap will fatally crash when using -O.
-            if is_admin():
-                cmd.insert(3, "-O")
-                cmd.insert(4, "--osscan-guess")
-            else:
-                logger.info(f"[{ip}] Running without Admin rights — skipping OS detection (-O) to prevent Nmap crash.")
 
-            await asyncio.to_thread(
+            # Add OS detection with higher confidence if admin
+            if is_admin():
+                cmd += ["-O", "--osscan-guess", "--max-os-tries", "3"]
+            else:
+                logger.info(f"[{ip}] Running without Admin rights — skipping OS detection (-O).")
+
+            # Run subprocess with no timeout (None) – we rely on Nmap's --host-timeout
+            proc = await asyncio.to_thread(
                 subprocess.run, cmd,
-                capture_output=True, check=False, timeout=300,
+                capture_output=True, check=False, timeout=None,  # No subprocess timeout
             )
             result = _parse_service_xml(tmp)
-            
-            # Apply defaults to avoid nulls
+
             if result is not None:
-                if not result.get("mac"):
-                    result["mac"] = await asyncio.to_thread(_get_mac_from_arp, ip)
-                if not result.get("os"):
-                    result["os"] = "Unknown"
-                if not result.get("hostname") or result["hostname"] == "Unknown":
-                    try:
-                        hn = await asyncio.to_thread(socket.gethostbyaddr, ip)
-                        result["hostname"] = hn[0] if hn else "Unknown"
-                    except Exception:
-                        result["hostname"] = "Unknown"
-                
+                result = await _enrich_host_result(result, ip, arp_snapshot, mdns_names, gateway_ip, local_ips)
+                result["discovery_method"] = "deep-scan-extreme"
+                result["nse_vulns"] = result.get("nse_vulns", [])
+
                 duration = asyncio.get_event_loop().time() - t0
                 logger.info(
-                    f"[SERVICE SCAN] {ip} — {len(result['services'])} ports open, "
-                    f"OS: {result['os']} — {duration:.1f}s"
+                    f"[SERVICE SCAN - EXTREME] {ip} — {len(result['services'])} ports open, "
+                    f"OS: {result['os']} ({result['os_confidence']}), device: {result['device_classification']}, "
+                    f"hostname: {result['hostname']} ({result['hostname_source']}) — {duration:.1f}s"
                 )
-            return result
-        except Exception as exc:
-            logger.error(f"[SERVICE SCAN] Error on {ip}: {exc}")
-            return None
-        finally:
-            tmp.unlink(missing_ok=True)
+                return result
 
-async def fast_os_scan_host(ip: str) -> dict | None:
-    """Lightweight scan for secondary targets to get OS, Hostname and basic ports."""
-    async with _sem:
-        tmp = Path(tempfile.mktemp(suffix=f"_fast_{ip.replace('.','_')}.xml"))
-        try:
-            cmd = [
-                NMAP_PATH,
-                "-Pn",               # skip discovery
-                "-F",                # top 100 ports
-                "-T5",               # insane timing for speed
-                "--max-retries", "1",
-                "--min-parallelism", "100",
-                "-oX", str(tmp),
-                ip,
-            ]
-            
-            if is_admin():
-                cmd.insert(3, "-O")
-                cmd.insert(4, "--osscan-guess")
-                
-            await asyncio.to_thread(
-                subprocess.run, cmd,
-                capture_output=True, check=False, timeout=120,
-            )
-            result = _parse_service_xml(tmp)
-            
-            if result is not None:
-                if not result.get("mac"):
-                    result["mac"] = await asyncio.to_thread(_get_mac_from_arp, ip)
-                if not result.get("os"):
-                    result["os"] = "Unknown"
-                if not result.get("hostname") or result["hostname"] == "Unknown":
-                    try:
-                        hn = await asyncio.to_thread(socket.gethostbyaddr, ip)
-                        result["hostname"] = hn[0] if hn else "Unknown"
-                    except Exception:
-                        result["hostname"] = "Unknown"
-            return result
+            stderr_tail = (proc.stderr or b"").decode(errors="replace")[-400:] if proc else ""
+            logger.warning(f"[SERVICE SCAN - EXTREME] No XML/host-up result for {ip} (rc={getattr(proc, 'returncode', '?')}). stderr: {stderr_tail!r}")
+
+            if attempt < max_attempts:
+                logger.warning(f"[SERVICE SCAN - EXTREME] Empty/failed result for {ip}, retrying once")
+                return await service_scan_host(ip, arp_snapshot, mdns_names, gateway_ip, local_ips, attempt + 1, max_attempts)
+            logger.error(f"[SERVICE SCAN - EXTREME] Giving up on {ip} after {max_attempts} attempts")
+            return None
+
+        except subprocess.TimeoutExpired:
+            # This shouldn't happen since timeout=None, but keep it for safety.
+            duration = asyncio.get_event_loop().time() - t0
+            logger.error(f"[SERVICE SCAN - EXTREME] Subprocess timeout (unexpected) on {ip} after {duration:.0f}s — not retrying")
+            return None
         except Exception as exc:
-            logger.error(f"[FAST SCAN] Error on {ip}: {exc}")
+            logger.error(f"[SERVICE SCAN - EXTREME] Error on {ip}: {exc}")
+            if attempt < max_attempts:
+                return await service_scan_host(ip, arp_snapshot, mdns_names, gateway_ip, local_ips, attempt + 1, max_attempts)
             return None
         finally:
             tmp.unlink(missing_ok=True)
 
 
-# ── Step 3: Nuclei on web ports ───────────────────────────────────────────────
 WEB_PORTS = {80, 443, 8080, 8443, 3000, 8000, 8888, 9090, 9443, 4443}
 HTTPS_PORTS = {443, 8443, 9443, 4443}
 
 async def nuclei_scan_host(ip: str, open_ports: list[int]) -> list[dict]:
-    """Run Nuclei on every web port found for this host concurrently. Failures are isolated."""
     web_ports = [p for p in open_ports if p in WEB_PORTS]
     if not web_ports:
         return []
 
-    async def _scan_single_port(port: int) -> list[dict]:
+    async def _scan_single_port(port: int, attempt: int = 1, max_attempts: int = 2) -> list[dict]:
         scheme = "https" if port in HTTPS_PORTS else "http"
         url = f"{scheme}://{ip}:{port}"
         tmp = Path(tempfile.mktemp(suffix=f"_nuclei_{ip.replace('.','_')}_{port}.json"))
@@ -629,81 +1356,114 @@ async def nuclei_scan_host(ip: str, open_ports: list[int]) -> list[dict]:
             cmd = [
                 NUCLEI_PATH,
                 "-u", url,
-                "-tags", "cve,vuln,default-login,panel,rce,lfi,sqli,xss",
+                "-tags", "cve,vuln,default-login,panel,rce,lfi,sqli,xss,exposure,misconfig,auth-bypass",
                 "-severity", "critical,high,medium,low,info",
                 "-jsonl",
                 "-o", str(tmp),
                 "-silent",
-                "-ni",               # no interactive prompts
-                "-duc",              # disable update checks that could freeze
-                "-timeout", "5",     # reduced timeout for faster execution
+                "-ni",
+                "-duc",
+                "-timeout", "10",
                 "-retries", "1",
             ]
             async with _sem:
                 await asyncio.to_thread(
                     subprocess.run, cmd,
-                    capture_output=True, check=False, timeout=300,
+                    capture_output=True, check=False, timeout=180,
                 )
             vulns = _parse_nuclei_jsonl(tmp)
             logger.info(f"[NUCLEI] {ip}:{port} — {len(vulns)} vulnerabilities found")
             return vulns
+        except subprocess.TimeoutExpired:
+            logger.error(f"[NUCLEI] Timed out on {ip}:{port} — not retrying")
+            return []
         except Exception as exc:
-            # Nuclei failure on one port must NOT crash the overall scan
             logger.error(f"[NUCLEI] Error on {ip}:{port}: {exc}")
+            if attempt < max_attempts:
+                return await _scan_single_port(port, attempt + 1, max_attempts)
             return []
         finally:
             tmp.unlink(missing_ok=True)
 
-    # Run scans for all web ports on this host concurrently
     results = await asyncio.gather(*[_scan_single_port(p) for p in web_ports])
-    
     all_vulns: list[dict] = []
     for r in results:
         all_vulns.extend(r)
     return all_vulns
 
 
-# ── Step 4: atomic DB persistence ─────────────────────────────────────────────
 async def persist_results(scan_id: str, host_results: list[dict]) -> None:
     logger.info(f"[PERSIST] Saving {len(host_results)} hosts to database")
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            # Delete previous data for this scan (cascade removes services + vulns)
             await session.execute(delete(Host).where(Host.scan_id == scan_id))
 
             for hr in host_results:
-                # ── Guarantee no null hostname/os — every Host row must have a value
                 host = Host(
                     scan_id=scan_id,
                     ip=hr["ip"],
+                    ipv6=hr.get("ipv6"),
                     hostname=hr.get("hostname") or "Unknown",
-                    os=hr.get("os")           or "Unknown",
+                    hostname_source=hr.get("hostname_source") or "unknown",
+                    hostname_confidence=hr.get("hostname_confidence", 0.0),
+                    os=hr.get("os") or "Unknown",
+                    os_family=hr.get("os_family") or "Unknown",
+                    os_version=hr.get("os_version") or "Unknown",
+                    os_confidence=hr.get("os_confidence") or "unknown",
+                    device_type=hr.get("device_type") or "Unknown",
+                    device_classification=hr.get("device_classification") or "Unknown Device",
+                    manufacturer=hr.get("manufacturer") or "Unknown",
                     mac_address=hr.get("mac") or "Unknown",
+                    mac_vendor=hr.get("mac_vendor"),
+                    network_interface=hr.get("network_interface"),
+                    architecture=hr.get("architecture"),
+                    uptime=hr.get("uptime"),
+                    is_gateway=hr.get("is_gateway", False),
+                    is_local_machine=hr.get("is_local_machine", False),
+                    is_vm=hr.get("is_vm", False),
+                    is_docker=hr.get("is_docker", False),
+                    is_wsl=hr.get("is_wsl", False),
                     status="up",
+                    audit_status="completed",
+                    last_scan=datetime.utcnow(),
+                    risk_score=hr.get("risk_score", 0.0),
+                    criticality=hr.get("criticality") or "Unknown",
+                    discovery_method=hr.get("discovery_method") or "unknown",
+                    running_applications=hr.get("running_applications", []),
+                    screenshot_path=hr.get("screenshot_path"),
+                    evidence=hr.get("evidence", []),
                 )
                 session.add(host)
-                await session.flush()  # populate host.id before children
+                await session.flush()
+
+
+
+
 
                 for svc in hr.get("services", []):
                     session.add(Service(
                         host_id=host.id,
                         port=svc["port"],
                         protocol=svc.get("protocol") or "tcp",
-                        name=svc.get("name")         or "Unknown",
-                        version=svc.get("version")   or "Unknown",
-                        state=svc.get("state")       or "open",
+                        name=svc.get("name") or "Unknown",
+                        version=svc.get("version") or "Unknown",
+                        state=svc.get("state") or "open",
+                        banner=svc.get("banner"),
                     ))
 
-                for vuln in hr.get("vulns", []):
+                all_vulns = []
+                all_vulns.extend(hr.get("nse_vulns", []))
+                all_vulns.extend(hr.get("vulns", []))
+                all_vulns.extend(hr.get("cred_vulns", []))
+
+                for vuln in all_vulns:
                     sev = (vuln.get("severity") or "info").lower()
-                    # ── cvss_score: float or None
                     raw_cvss = vuln.get("cvss_score")
                     try:
                         cvss_score = float(raw_cvss) if raw_cvss is not None else None
                     except (ValueError, TypeError):
                         cvss_score = None
                     cvss_estimated = bool(vuln.get("cvss_estimated", False))
-                    # ── matcher_name: never empty
                     matcher_name = (
                         vuln.get("matcher_name")
                         or vuln.get("template_id")
@@ -712,35 +1472,19 @@ async def persist_results(scan_id: str, host_results: list[dict]) -> None:
                     session.add(Vulnerability(
                         host_id=host.id,
                         template_id=vuln.get("template_id") or "unknown",
-                        name=vuln.get("name")               or "Unknown vulnerability",
+                        name=vuln.get("name") or "Unknown vulnerability",
                         severity=sev,
                         cve_id=vuln.get("cve_id"),
                         description=vuln.get("description") or "",
                         matcher_name=matcher_name,
                         cvss_score=cvss_score,
                         cvss_estimated=cvss_estimated,
-                        source=vuln.get("source")            or "nuclei",
+                        source=vuln.get("source") or "nuclei",
                         discovered_at=datetime.utcnow(),
+                        remediation=vuln.get("remediation"),
+                        exploit_available=vuln.get("exploit_available", False),
+                        references=vuln.get("references", []),
                     ))
-
-                # ── Add credential testing vulnerabilities if any
-                cred_results = hr.get("cred_vulns", [])
-                if cred_results:
-                    cred_vulns = credential_results_to_vulnerabilities(host.id, cred_results)
-                    for cred_vuln in cred_vulns:
-                        session.add(Vulnerability(
-                            host_id=host.id,
-                            template_id=cred_vuln["template_id"],
-                            name=cred_vuln["name"],
-                            severity=cred_vuln["severity"],
-                            cve_id=cred_vuln["cve_id"],
-                            description=cred_vuln["description"],
-                            matcher_name=cred_vuln["matcher_name"],
-                            cvss_score=cred_vuln["cvss_score"],
-                            cvss_estimated=cred_vuln["cvss_estimated"],
-                            source=cred_vuln["source"],
-                            discovered_at=cred_vuln["discovered_at"],
-                        ))
 
             await session.execute(
                 update(Scan)
@@ -753,7 +1497,51 @@ async def persist_results(scan_id: str, host_results: list[dict]) -> None:
             )
 
 
-# ── Full orchestrator ─────────────────────────────────────────────────────────
+# =============================================================================
+# FIXED: async fallback host result (no asyncio.run)
+# =============================================================================
+async def _fallback_host_result(
+    ip: str, arp_snapshot: dict, mdns_names: dict, gateway_ip: str | None, local_ips: set,
+    mac: str | None, mac_vendor: str | None,
+) -> dict:
+    """Async fallback record for a host that couldn't be scanned."""
+    hostname, hostname_source, hostname_confidence = resolve_hostname_multi(ip, None, {}, mdns_names)
+    os_name, os_confidence, os_family, os_version = await resolve_os_multi(None, 0, {}, [], mac_vendor, None)
+    is_vm, is_docker, is_wsl = detect_vm_docker_wsl(mac_vendor, {}, [], hostname)
+    dev_type, dev_class = classify_device(os_name, os_family, mac_vendor, [], hostname, is_vm, is_docker, is_wsl)
+
+    return {
+        "ip": ip,
+        "hostname": hostname,
+        "hostname_source": hostname_source,
+        "hostname_confidence": hostname_confidence,
+        "os": os_name,
+        "os_confidence": os_confidence,
+        "os_family": os_family,
+        "os_version": os_version,
+        "mac": mac,
+        "mac_vendor": mac_vendor,
+        "device_type": dev_type,
+        "device_classification": dev_class,
+        "manufacturer": mac_vendor or "Unknown",
+        "is_gateway": (gateway_ip is not None and ip == gateway_ip),
+        "is_local_machine": (ip in local_ips) if local_ips else False,
+        "is_vm": is_vm,
+        "is_docker": is_docker,
+        "is_wsl": is_wsl,
+        "services": [],
+        "vulns": [],
+        "cred_vulns": [],
+        "nse_vulns": [],
+        "discovery_method": "fallback-unreachable",
+        "risk_score": 0.0,
+        "criticality": "Low",
+    }
+
+
+# =============================================================================
+# run_pipeline with async fallback calls and EVIDENCE CAPTURE
+# =============================================================================
 async def run_pipeline(scan_id: str, target: str) -> None:
     logger.info(f"[SCAN START] scan_id={scan_id} target={target}")
     t0 = asyncio.get_event_loop().time()
@@ -768,7 +1556,6 @@ async def run_pipeline(scan_id: str, target: str) -> None:
                 )
 
     try:
-        # Determine target_ip and discovery_target
         try:
             net = ipaddress.ip_network(target, strict=False)
             if net.num_addresses == 1:
@@ -783,23 +1570,36 @@ async def run_pipeline(scan_id: str, target: str) -> None:
             target_ip = None
             discovery_target = target
 
-        # Step 1 — discover live hosts
+        gateway_ip = await asyncio.to_thread(_get_default_gateway)
+        local_ips = await asyncio.to_thread(_get_local_ips)
+        logger.info(f"[PIPELINE] Gateway detected: {gateway_ip}, Local IPs: {local_ips}")
+
         live_ips = await discover_hosts(discovery_target)
         if not live_ips:
             await _mark_failed("no_hosts_found")
             logger.warning(f"[SCAN] No live hosts found for {discovery_target}")
             return
 
-        # Step 2 — parallel deep service scan (capped by semaphore)
         live_ips_list = list(live_ips)
-        
-        scan_tasks = []
-        for ip in live_ips_list:
-            if target_ip is None or ip == target_ip:
-                scan_tasks.append(service_scan_host(ip))
-            else:
-                scan_tasks.append(fast_os_scan_host(ip))
+        if target_ip and target_ip in live_ips_list:
+            live_ips_list.remove(target_ip)
+            live_ips_list.insert(0, target_ip)
 
+        logger.info(
+            f"[PIPELINE] {len(live_ips_list)} host(s) discovered. "
+            f"ALL hosts will receive an EXTREME deep scan (nmap -Pn -sS -sV -A -p- --script full)."
+        )
+
+        mdns_names = await asyncio.to_thread(snapshot_mdns_names, 4.0)
+        arp_snapshot = await asyncio.to_thread(snapshot_arp_table)
+        local_macs = await asyncio.to_thread(get_local_interface_macs)
+        arp_snapshot.update(local_macs)
+        logger.info(f"[PIPELINE] ARP snapshot captured: {len(arp_snapshot)} entries")
+
+        await ensure_mac_vendor_db_loaded()
+
+        # EXTREME deep scan for EVERY host
+        scan_tasks = [service_scan_host(ip, arp_snapshot, mdns_names, gateway_ip, local_ips) for ip in live_ips_list]
         scan_raw = await asyncio.gather(*scan_tasks, return_exceptions=True)
 
         host_results: list[dict] = []
@@ -807,26 +1607,30 @@ async def run_pipeline(scan_id: str, target: str) -> None:
             ip = live_ips_list[i]
             if isinstance(res, Exception):
                 logger.error(f"[SERVICE SCAN] Unexpected error for {ip}: {res}")
-                mac = await asyncio.to_thread(_get_mac_from_arp, ip)
-                host_results.append({"ip": ip, "hostname": "Unknown", "os": "Unknown", "mac": mac, "services": [], "vulns": []})
+                mac = arp_snapshot.get(ip) or await asyncio.to_thread(_get_mac_from_arp, ip)
+                mac_vendor = await guess_vendor_from_mac(mac)
+                host_results.append(await _fallback_host_result(ip, arp_snapshot, mdns_names, gateway_ip, local_ips, mac, mac_vendor))
             elif res is not None:
                 host_results.append(res)
             else:
-                # Nmap didn't return an XML for this host, but we know it's alive from discovery
-                mac = await asyncio.to_thread(_get_mac_from_arp, ip)
-                host_results.append({"ip": ip, "hostname": "Unknown", "os": "Unknown", "mac": mac, "services": [], "vulns": []})
+                mac = arp_snapshot.get(ip) or await asyncio.to_thread(_get_mac_from_arp, ip)
+                mac_vendor = await guess_vendor_from_mac(mac)
+                host_results.append(await _fallback_host_result(ip, arp_snapshot, mdns_names, gateway_ip, local_ips, mac, mac_vendor))
 
-        # Step 3 — Nuclei on web ports for each host (per-host errors isolated)
-        nuclei_tasks = []
-        for hr in host_results:
-            ip = hr["ip"]
-            if target_ip is None or ip == target_ip:
-                nuclei_tasks.append(nuclei_scan_host(ip, [s["port"] for s in hr.get("services", [])]))
-            else:
-                async def _empty_nuclei():
-                    return []
-                nuclei_tasks.append(_empty_nuclei())
+        if len(host_results) != len(live_ips_list):
+            logger.warning(
+                f"[PIPELINE] host_results ({len(host_results)}) != discovered hosts ({len(live_ips_list)}) — reconciling"
+            )
+            seen_ips = {hr["ip"] for hr in host_results}
+            for ip in live_ips_list:
+                if ip not in seen_ips:
+                    host_results.append(await _fallback_host_result(ip, arp_snapshot, mdns_names, gateway_ip, local_ips, arp_snapshot.get(ip), None))
 
+        # Nuclei on web ports for ALL hosts
+        nuclei_tasks = [
+            nuclei_scan_host(hr["ip"], [s["port"] for s in hr.get("services", [])])
+            for hr in host_results
+        ]
         nuclei_raw = await asyncio.gather(*nuclei_tasks, return_exceptions=True)
 
         for i, res in enumerate(nuclei_raw):
@@ -836,104 +1640,144 @@ async def run_pipeline(scan_id: str, target: str) -> None:
             else:
                 host_results[i]["vulns"] = res
 
-        # =========================================================================
-        # 🔑 NEW STAGE: CREDENTIAL TESTING
-        # =========================================================================
+        # Credential testing
         logger.info("[CRED TEST] Starting credential testing stage")
-        cred_test_tasks = []
-        for hr in host_results:
-            if target_ip is None or hr["ip"] == target_ip:
-                cred_test_tasks.append(run_credential_tests(hr))
-            else:
-                async def _empty_cred():
-                    return []
-                cred_test_tasks.append(_empty_cred())
-
+        cred_test_tasks = [run_credential_tests(hr) for hr in host_results]
         cred_results_raw = await asyncio.gather(*cred_test_tasks, return_exceptions=True)
 
-        # Merge credential vulnerabilities into host results
         for i, res in enumerate(cred_results_raw):
             if isinstance(res, Exception):
                 logger.error(f"[CRED TEST] Error for host {host_results[i]['ip']}: {res}")
                 host_results[i]["cred_vulns"] = []
             else:
-                # Credential vulnerabilities will be added during persist phase
                 host_results[i]["cred_vulns"] = res if res else []
 
-        # =========================================================================
-        # 🔍 NEW STAGE: CVE ENRICHMENT  
-        # =========================================================================
+        # ── EVIDENCE CAPTURE ────────────────────────────────────────────────
+        logger.info("[EVIDENCE] Capturing screenshots and text evidence")
+        for hr in host_results:
+            hr["evidence"] = []
+            hr["screenshot_path"] = None
+            # 1. Web screenshots for each open web port
+            for svc in hr.get("services", []):
+                port = svc.get("port")
+                if port in WEB_PORTS:
+                    scheme = "https" if port in HTTPS_PORTS else "http"
+                    url = f"{scheme}://{hr['ip']}:{port}"
+                    screenshot_path = await capture_host_screenshot(scan_id, hr['ip'], port, url)
+                    if screenshot_path:
+                        path_str = str(screenshot_path)
+                        hr["evidence"].append({
+                            "type": "web_screenshot",
+                            "path": path_str,
+                            "label": f"Capture écran web {hr['ip']}:{port}"
+                        })
+                        if not hr["screenshot_path"]:
+                            hr["screenshot_path"] = path_str
+
+            # 2. Credential evidence (auth screenshots for web, text for others)
+            for cred in hr.get("cred_vulns", []):
+                if cred.get("vulnerable") and cred.get("credentials_found"):
+                    service = cred.get("service", "")
+                    port = cred.get("port", 0)
+                    if port in WEB_PORTS and service.lower() in ["http", "https", "web"]:
+                        # Try auth screenshot for each found credential
+                        for c in cred["credentials_found"]:
+                            url = f"http://{hr['ip']}:{port}" if port != 443 else f"https://{hr['ip']}:{port}"
+                            auth_path = await capture_auth_screenshot(
+                                scan_id, hr['ip'], port, url,
+                                c["username"], c["password"]
+                            )
+                            if auth_path:
+                                path_str = str(auth_path)
+                                hr["evidence"].append({
+                                    "type": "auth_screenshot",
+                                    "path": path_str,
+                                    "label": f"Authentification réussie sur {service}:{port} avec {c['username']}"
+                                })
+                                if not hr["screenshot_path"]:
+                                    hr["screenshot_path"] = path_str
+                                break  # stop after first success
+                    else:
+                        # Non-web: text evidence
+                        text_ev = capture_credential_text(
+                            scan_id, hr['ip'], port, service,
+                            cred["credentials_found"]
+                        )
+                        hr["evidence"].append(text_ev)
+
+        # CVE enrichment
         logger.info("[CVE ENRICH] Starting CVE enrichment stage")
         all_vulns = []
         for hr in host_results:
             all_vulns.extend(hr.get("vulns", []))
             all_vulns.extend(hr.get("cred_vulns", []))
+            all_vulns.extend(hr.get("nse_vulns", []))
 
         if all_vulns:
-            # Enrich vulnerabilities with NVD data
             enriched_vulns = await enrich_vulnerabilities_list(all_vulns)
-            
-            # Distribute enriched vulns back to hosts
             vuln_index = 0
             for hr in host_results:
-                total_vulns = len(hr.get("vulns", [])) + len(hr.get("cred_vulns", []))
+                total_vulns = len(hr.get("vulns", [])) + len(hr.get("cred_vulns", [])) + len(hr.get("nse_vulns", []))
                 if total_vulns > 0:
                     hr["all_enriched_vulns"] = enriched_vulns[vuln_index:vuln_index + total_vulns]
                     vuln_index += total_vulns
                 else:
                     hr["all_enriched_vulns"] = []
-        # =========================================================================
 
-        # Step 4 — atomic DB write
+        # Risk scoring
+        for hr in host_results:
+            all_vulns_for_host = hr.get("vulns", []) + hr.get("cred_vulns", []) + hr.get("nse_vulns", [])
+            score = calculate_host_risk_score(
+                all_vulns_for_host,
+                hr.get("services", []),
+                hr.get("cred_vulns", [])
+            )
+            hr["risk_score"] = score
+            hr["criticality"] = criticality_from_score(score)
+
+        # Persist
         await persist_results(scan_id, host_results)
 
-        # =====================================================================
-        # 🤖 NEW STAGE: AI AUDIT ANALYSIS
-        # =====================================================================
+        # AI Audit Analysis (fallback if Ollama not available)
         logger.info("[AI ANALYSIS] Generating scan-level audit analysis")
         try:
             from services.audit_analysis import generate_audit_analysis, persist_audit_analysis
-            analysis = await generate_audit_analysis(scan_id)
+            analysis = await asyncio.wait_for(generate_audit_analysis(scan_id), timeout=90)
             if analysis:
                 await persist_audit_analysis(scan_id, analysis)
                 mode = "AI" if analysis.get("ai_generated") else "fallback"
-                logger.info(f"[AI ANALYSIS] Completed ({mode} mode) - keys: {list(analysis.keys())}")
+                logger.info(f"[AI ANALYSIS] Completed ({mode} mode)")
             else:
                 logger.warning("[AI ANALYSIS] generate_audit_analysis returned None/empty")
         except Exception as exc:
             logger.exception(f"[AI ANALYSIS] Failed (non-fatal): {exc}")
-            # Create minimal fallback to ensure analysis exists
             try:
                 from services.audit_analysis import build_fallback_analysis, build_scan_context, persist_audit_analysis
                 context = await build_scan_context(scan_id)
                 if context:
                     fallback = build_fallback_analysis(context)
                     await persist_audit_analysis(scan_id, fallback)
-                    logger.info("[AI ANALYSIS] Fallback analysis persisted as backup")
+                    logger.info("[AI ANALYSIS] Fallback analysis persisted")
             except Exception as fallback_exc:
                 logger.error(f"[AI ANALYSIS] Fallback also failed: {fallback_exc}")
-        # =====================================================================
 
         duration = asyncio.get_event_loop().time() - t0
-        logger.info(f"[SCAN DONE] scan_id={scan_id} duration={duration:.1f}s")
+        logger.info(f"[SCAN DONE] scan_id={scan_id} duration={duration:.1f}s hosts_audited={len(host_results)}")
 
     except Exception as exc:
         logger.exception(f"[PIPELINE ERROR] scan_id={scan_id}: {exc}")
         await _mark_failed(str(exc))
 
-# =============================================================================
-# INPUT NORMALISATION
-# =============================================================================
+
 def normalize_target(raw: str) -> str:
     raw = raw.strip()
     try:
         net = ipaddress.ip_network(raw, strict=False)
         return str(net)
     except ValueError:
-        # Allow nmap range notation like 192.168.1.1-50
         if "-" in raw:
             return raw
-        raise ValueError(f"Invalid target format: '{raw}'. Use an IP, CIDR, or range (e.g. 192.168.1.1-50).")
+        raise ValueError(f"Invalid target format: '{raw}'. Use an IP, CIDR, or range.")
 
 # =============================================================================
 # FASTAPI APPLICATION
@@ -941,7 +1785,7 @@ def normalize_target(raw: str) -> str:
 app = FastAPI(
     title="Network Audit API",
     description="Automated host discovery, service scanning, credential testing, and vulnerability assessment with CVE enrichment.",
-    version="3.0.0",
+    version="5.1.0",
 )
 
 app.add_middleware(
@@ -951,25 +1795,93 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from fastapi.staticfiles import StaticFiles
+os.makedirs("data/screenshots", exist_ok=True)
+app.mount("/screenshots", StaticFiles(directory="data/screenshots"), name="screenshots")
+
+
 
 @app.on_event("startup")
 async def startup() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("✅ Database tables ready.")
-    logger.info(f"📡 nmap   → {NMAP_PATH}")
-    logger.info(f"🔍 nuclei → {NUCLEI_PATH}")
-    logger.info("🔑 Credential testing module loaded")
-    logger.info("🌐 CVE enrichment module loaded")
+    logger.info("Database tables ready.")
+    logger.info(f"nmap   → {NMAP_PATH}")
+    logger.info(f"nuclei → {NUCLEI_PATH}")
+    await ensure_mac_vendor_db_loaded()
+    logger.info("ALL hosts receive an EXTREME deep scan (nmap -Pn -sS -sV -A -p- --script full).")
 
 
-# ── POST /scan ────────────────────────────────────────────────────────────────
+def _host_to_dict(h: "Host") -> dict:
+    return {
+        "host_id":              h.id,
+        "ip":                   h.ip,
+        "ipv6":                 h.ipv6,
+        "hostname":             h.hostname or "Unknown",
+        "hostname_source":      h.hostname_source or "unknown",
+        "hostname_confidence":  h.hostname_confidence,
+        "os":                   h.os or "Unknown",
+        "os_family":            h.os_family or "Unknown",
+        "os_version":           h.os_version or "Unknown",
+        "os_confidence":        h.os_confidence or "unknown",
+        "device_type":          h.device_type or "Unknown",
+        "device_classification": h.device_classification or "Unknown Device",
+        "manufacturer":         h.manufacturer or "Unknown",
+        "mac_address":          h.mac_address or "Unknown",
+        "mac_vendor":           h.mac_vendor,
+        "network_interface":    h.network_interface,
+        "architecture":         h.architecture,
+        "uptime":               h.uptime,
+        "is_gateway":           h.is_gateway,
+        "is_local_machine":     h.is_local_machine,
+        "is_vm":                h.is_vm,
+        "is_docker":            h.is_docker,
+        "is_wsl":               h.is_wsl,
+        "status":               h.status or "up",
+        "audit_status":         h.audit_status or "pending",
+        "last_scan":            h.last_scan.isoformat() if h.last_scan else None,
+        "risk_score":           h.risk_score,
+        "criticality":          h.criticality or "Unknown",
+        "discovery_method":     h.discovery_method,
+        "scanned":              len(h.services) > 0,
+        "running_applications": h.running_applications or [],
+        "screenshot_path":      h.screenshot_path,
+        "evidence":             h.evidence or [],
+
+        "services": [
+            {
+                "port":     s.port,
+                "protocol": s.protocol or "tcp",
+                "name":     s.name or "Unknown",
+                "version":  s.version or "Unknown",
+                "state":    s.state or "open",
+                "banner":   s.banner,
+            }
+            for s in sorted(h.services, key=lambda svc: svc.port)
+        ],
+        "vulnerabilities": [
+            {
+                "template_id":       v.template_id,
+                "name":              v.name,
+                "severity":          v.severity,
+                "cve_id":            v.cve_id,
+                "cvss_score":        float(v.cvss_score) if v.cvss_score else None,
+                "cvss_estimated":    bool(v.cvss_estimated),
+                "description":       v.description or "",
+                "matcher_name":      v.matcher_name or v.template_id or "default",
+                "source":            v.source or "nuclei",
+                "remediation":       v.remediation,
+                "exploit_available": v.exploit_available,
+                "references":        v.references or [],
+                "discovered_at":     v.discovered_at,
+            }
+            for v in h.vulnerabilities
+        ],
+    }
+
+
 @app.post("/scan", response_model=ScanResponse, status_code=202)
 async def create_scan(req: ScanRequest, background_tasks: BackgroundTasks):
-    """
-    Accepts a target (IP, CIDR, or range) and immediately returns a scan_id.
-    The full pipeline runs in the background — the caller polls /scan/{id}/status.
-    """
     try:
         norm_target = normalize_target(req.target)
     except ValueError as exc:
@@ -985,7 +1897,6 @@ async def create_scan(req: ScanRequest, background_tasks: BackgroundTasks):
     return ScanResponse(scan_id=scan_id, status="running", target=norm_target)
 
 
-# ── GET /scan/{scan_id}/status ────────────────────────────────────────────────
 @app.get("/scan/{scan_id}/status", response_model=StatusResponse)
 async def get_status(scan_id: str):
     async with AsyncSessionLocal() as session:
@@ -1003,15 +1914,9 @@ async def get_status(scan_id: str):
     )
 
 
-# ── GET /scan/{scan_id}/results ───────────────────────────────────────────────
 @app.get("/scan/{scan_id}/results")
 async def get_results(scan_id: str):
-    """
-    Returns a fully nested structure: Scan → Hosts → Services + Vulnerabilities.
-    Uses selectinload to avoid N+1 queries.
-    """
     async with AsyncSessionLocal() as session:
-        # Load scan
         s_res = await session.execute(select(Scan).where(Scan.id == scan_id))
         scan = s_res.scalar_one_or_none()
         if not scan:
@@ -1020,7 +1925,6 @@ async def get_results(scan_id: str):
         if scan.status == "running":
             raise HTTPException(status_code=202, detail="Scan is still running.")
 
-        # Load hosts with services and vulnerabilities in 2 extra SELECT statements
         h_res = await session.execute(
             select(Host)
             .where(Host.scan_id == scan_id)
@@ -1031,7 +1935,6 @@ async def get_results(scan_id: str):
         )
         hosts = h_res.scalars().unique().all()
 
-    # Collect all vulns for health-score calculation
     all_vulns_flat = [
         {"severity": v.severity}
         for h in hosts for v in h.vulnerabilities
@@ -1047,52 +1950,13 @@ async def get_results(scan_id: str):
         "health_score": health_score,
         "started_at":   scan.started_at,
         "finished_at":  scan.finished_at,
-        "hosts": [
-            {
-                "host_id":     h.id,
-                "ip":          h.ip,
-                "hostname":    h.hostname or "Unknown",
-                "os":          h.os       or "Unknown",
-                "mac_address": h.mac_address or "Unknown",
-                "status":      h.status or "up",
-                "scanned":     len(h.services) > 0,
-                "services": [
-                    {
-                        "port":     s.port,
-                        "protocol": s.protocol or "tcp",
-                        "name":     s.name     or "Unknown",
-                        "version":  s.version  or "Unknown",
-                        "state":    s.state    or "open",
-                    }
-                    for s in h.services
-                ],
-                "vulnerabilities": [
-                    {
-                        "template_id":    v.template_id,
-                        "name":           v.name,
-                        "severity":       v.severity,
-                        "cve_id":         v.cve_id,
-                        "cvss_score":     float(v.cvss_score) if v.cvss_score else None,
-                        "cvss_estimated": bool(v.cvss_estimated),
-                        "description":    v.description or "",
-                        "matcher_name":   v.matcher_name or v.template_id or "default",
-                        "source":         v.source or "nuclei",
-                        "discovered_at":  v.discovered_at,
-                    }
-                    for v in h.vulnerabilities
-                ],
-            }
-            for h in hosts
-        ],
+        "hosts":        [_host_to_dict(h) for h in hosts],
     }
 
 
-# ── GET /scans ────────────────────────────────────────────────────────────────
 @app.get("/scans")
 async def list_scans():
-    """Returns the most recent scan ONLY, with full detailed host information."""
     async with AsyncSessionLocal() as session:
-        # 1. Fetch only the most recent scan, but load all its related data
         res = await session.execute(
             select(Scan)
             .options(
@@ -1103,23 +1967,17 @@ async def list_scans():
             .limit(1)
         )
         latest_scan = res.scalar_one_or_none()
-        
+
     if not latest_scan:
         return []
 
-    # 2. Format the response with each IP in its own dictionary containing full info
-    # We sort the hosts by their IP mathematically to keep them perfectly organized
-    import ipaddress
-    
     sorted_hosts = sorted(latest_scan.hosts, key=lambda x: ipaddress.IPv4Address(x.ip))
-    
-    # Collect all vulns for health-score calculation
     all_vulns_flat = [
         {"severity": v.severity}
         for h in latest_scan.hosts for v in h.vulnerabilities
     ]
     health_score = compute_health_score(all_vulns_flat)
-    
+
     return [
         {
             "id":          latest_scan.id,
@@ -1131,62 +1989,22 @@ async def list_scans():
             "health_score": health_score,
             "started_at":  latest_scan.started_at,
             "finished_at": latest_scan.finished_at,
-            "discovered_ips": [
-                {
-                    "host_id":     h.id,
-                    "ip":          h.ip,
-                    "hostname":    h.hostname or "Unknown",
-                    "os":          h.os       or "Unknown",
-                    "mac_address": h.mac_address or "Unknown",
-                    "status":      h.status or "up",
-                    "scanned":     len(h.services) > 0,
-                    "services": [
-                        {
-                            "port": s.port,
-                            "protocol": s.protocol or "tcp",
-                            "name": s.name or "Unknown",
-                            "version": s.version or "Unknown",
-                            "state": s.state or "open"
-                        } for s in sorted(h.services, key=lambda svc: svc.port)
-                    ],
-                    "vulnerabilities": [
-                        {
-                            "template_id":    v.template_id,
-                            "name":           v.name,
-                            "severity":       v.severity,
-                            "cve_id":         v.cve_id,
-                            "cvss_score":     float(v.cvss_score) if v.cvss_score else None,
-                            "cvss_estimated": bool(v.cvss_estimated),
-                            "description":    v.description or "",
-                            "matcher_name":   v.matcher_name or v.template_id or "default",
-                            "source":         v.source or "nuclei",
-                            "discovered_at":  v.discovered_at,
-                        } for v in h.vulnerabilities
-                    ]
-                } for h in sorted_hosts
-            ]
+            "discovered_ips": [_host_to_dict(h) for h in sorted_hosts],
         }
     ]
 
 
-# ── GET /scan/{scan_id}/analysis ─────────────────────────────────────────────
 @app.get("/scan/{scan_id}/analysis")
 async def get_scan_analysis(scan_id: str):
-    """Returns the AI/rule-based audit analysis for a completed scan."""
     from services.audit_analysis import fetch_audit_analysis
-    logger.info(f"[ANALYSIS ENDPOINT] Requested analysis for scan_id: {scan_id}")
     analysis = await fetch_audit_analysis(scan_id)
     if not analysis:
-        logger.warning(f"[ANALYSIS ENDPOINT] No analysis found for scan_id: {scan_id}")
-        raise HTTPException(status_code=404, detail="Analyse non disponible — le scan est peut-être encore en cours.")
-    logger.info(f"[ANALYSIS ENDPOINT] Analysis found for scan_id: {scan_id}, returning {len(analysis)} fields")
+        raise HTTPException(status_code=404, detail="Analysis not available — scan may still be running.")
     return analysis
 
 
-# ── GET /scan/{scan_id}/report.pdf ────────────────────────────────────────────
 @app.get("/scan/{scan_id}/report.pdf")
 async def get_scan_report(scan_id: str):
-    """Generates and streams a polished PDF audit report."""
     try:
         from services.pdf_report import generate_pdf_report
         pdf_bytes = await generate_pdf_report(scan_id)
@@ -1197,10 +2015,9 @@ async def get_scan_report(scan_id: str):
         )
     except Exception as exc:
         logger.error(f"[PDF] Generation failed for {scan_id}: {exc}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la génération du rapport PDF: {exc}")
+        raise HTTPException(status_code=500, detail=f"PDF generation error: {exc}")
 
 
-# ── GET /health ───────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
     return {
@@ -1210,9 +2027,6 @@ async def health():
     }
 
 
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

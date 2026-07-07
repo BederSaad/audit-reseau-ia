@@ -4,23 +4,50 @@ import HostDetailPanel from './HostDetailPanel';
 import SkeletonLoader from './SkeletonLoader';
 import './DeviceTable.css';
 
-function UnknownVal({ value }) {
-  if (!value || value === 'Unknown') {
+function UnknownVal({ value, fallback }) {
+  if (!value || value === 'Unknown' || value === 'Unknown Device') {
     return (
-      <span className="unknown-val" style={{ color: 'var(--color-text-muted)', fontStyle: 'italic', fontSize: '0.85rem' }}>
-        Inconnu
+      <span className="unknown-val">
+        {fallback || 'Inconnu'}
       </span>
     );
   }
   return <>{value}</>;
 }
 
+function ConfidenceBadge({ confidence }) {
+  if (!confidence || confidence === 'unknown') return null;
+  const colors = {
+    confirmed: 'var(--neon-safe)',
+    inferred: 'var(--neon-medium)',
+    unknown: 'var(--color-text-muted)',
+  };
+  return (
+    <span className="confidence-badge" style={{ background: colors[confidence] }}>
+      {confidence}
+    </span>
+  );
+}
+
+function RiskBadge({ score, criticality }) {
+  const color = score >= 61 ? 'var(--neon-critical)' : score >= 41 ? 'var(--neon-high)' : score >= 21 ? 'var(--neon-medium)' : 'var(--neon-safe)';
+  return (
+    <div className="risk-badge">
+      <div className="risk-circle" style={{ borderColor: color, color }}>
+        {Math.round(score)}
+      </div>
+      <span className="risk-label">{criticality}</span>
+    </div>
+  );
+}
+
 function HostRow({ host, index }) {
   const [open, setOpen] = useState(false);
-  const isAudited = (host.services?.length ?? 0) > 0;
+  const isAudited = host.audit_status === 'completed';
   const vulnCount = host.vulnerabilities?.length ?? 0;
-  const maxSev    = getMaxSeverity(host.vulnerabilities ?? []);
+  const maxSev = getMaxSeverity(host.vulnerabilities ?? []);
   const hasCredIssues = host.vulnerabilities?.some(v => v.source === 'credential_test' && v.severity === 'critical');
+  const displayName = host.hostname !== 'Unknown' ? host.hostname : host.device_classification;
 
   return (
     <>
@@ -40,11 +67,28 @@ function HostRow({ host, index }) {
             <span className="host-index">#{index + 1}</span>
           </div>
         </td>
-        <td><UnknownVal value={host.hostname} /></td>
-        <td><UnknownVal value={host.os} /></td>
+        <td>
+          <div className="hostname-wrap">
+            <UnknownVal value={host.hostname} fallback={host.device_classification} />
+            {host.hostname_confidence > 0 && (
+              <span className="confidence-pct">({Math.round(host.hostname_confidence * 100)}%)</span>
+            )}
+          </div>
+        </td>
+        <td>
+          <div className="os-wrap">
+            <UnknownVal value={host.os} />
+            <ConfidenceBadge confidence={host.os_confidence} />
+          </div>
+        </td>
+        <td>
+          <UnknownVal value={host.device_classification} />
+        </td>
         <td>
           <span className="mac-addr"><UnknownVal value={host.mac_address} /></span>
+          {host.mac_vendor && <div className="mac-vendor">{host.mac_vendor}</div>}
         </td>
+        <td><RiskBadge score={host.risk_score || 0} criticality={host.criticality || 'Unknown'} /></td>
         <td>
           <span className={`badge ${isAudited ? 'badge--audited' : 'badge--detected'}`}>
             {isAudited ? 'Audité' : 'Détecté'}
@@ -54,31 +98,23 @@ function HostRow({ host, index }) {
           {vulnCount > 0 ? (
             <span className={`badge badge--${maxSev}`}>{vulnCount} vuln{vulnCount > 1 ? 's' : ''}</span>
           ) : (
-            <span style={{ color: 'var(--color-text-muted)', fontSize: '0.8rem' }}>—</span>
+            <span className="no-vuln">—</span>
           )}
         </td>
+        <td><span className="services-count">{host.services?.length ?? 0} ports</span></td>
         <td>
-          <span className="services-count">{host.services?.length ?? 0} ports</span>
-        </td>
-        <td>
-          <motion.span 
-            className="chevron" 
-            animate={{ rotate: open ? 180 : 0 }} 
-            transition={{ type: "spring", stiffness: 200, damping: 20 }}
-          >
-            ▼
-          </motion.span>
+          <motion.span className="chevron" animate={{ rotate: open ? 180 : 0 }} transition={{ type: 'spring', stiffness: 200, damping: 20 }}>▼</motion.span>
         </td>
       </tr>
       <AnimatePresence>
         {open && (
           <tr className="detail-row">
-            <td colSpan={9} style={{ padding: 0 }}>
+            <td colSpan={11} style={{ padding: 0 }}>
               <motion.div
                 initial={{ height: 0, opacity: 0 }}
                 animate={{ height: 'auto', opacity: 1 }}
                 exit={{ height: 0, opacity: 0 }}
-                transition={{ duration: 0.3, ease: "easeInOut" }}
+                transition={{ duration: 0.35, ease: 'easeInOut' }}
                 style={{ overflow: 'hidden' }}
               >
                 <HostDetailPanel host={host} />
@@ -113,9 +149,7 @@ export default function DeviceTable({ hosts, loading }) {
     return (
       <div className="glass-panel" style={{ padding: 24 }}>
         <h3 className="neon-text" style={{ padding: '0 0 16px', fontSize: '1.2rem', margin: 0 }}>🖥️ Appareils sur le réseau</h3>
-        <p style={{ color: 'var(--color-text-secondary)', fontSize: '0.9rem', padding: '12px 0' }}>
-          Aucun appareil découvert.
-        </p>
+        <p className="empty-message">Aucun appareil découvert.</p>
       </div>
     );
   }
@@ -134,8 +168,10 @@ export default function DeviceTable({ hosts, loading }) {
               <th>IP</th>
               <th>Hostname</th>
               <th>OS</th>
-              <th>MAC</th>
-              <th>Type</th>
+              <th>Device</th>
+              <th>MAC / Vendor</th>
+              <th>Risk</th>
+              <th>Status</th>
               <th>Vulnérabilités</th>
               <th>Ports</th>
               <th></th>

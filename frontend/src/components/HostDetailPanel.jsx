@@ -1,242 +1,258 @@
 import { useState } from 'react';
+import { motion } from 'framer-motion';
 import './HostDetailPanel.css';
 
-const SEV_WEIGHTS = { critical: 10, high: 6, medium: 3, low: 1, info: 0 };
+const SEV_COLOR = {
+  critical: 'var(--neon-critical)',
+  high: 'var(--neon-high)',
+  medium: 'var(--neon-medium)',
+  low: 'var(--neon-low)',
+  info: 'var(--neon-info)',
+};
 
-function UnknownVal({ value }) {
-  if (!value || value === 'Unknown') {
-    return (
-      <span className="unknown-val" style={{ color: 'var(--color-text-muted)', fontStyle: 'italic', fontSize: '0.85rem' }}>
-        Inconnu
-      </span>
-    );
-  }
-  return <span>{value}</span>;
-}
-
-function SevBadge({ sev }) {
-  const s = (sev || 'info').toLowerCase();
-  return <span className={`badge badge--${s}`}>{sev}</span>;
-}
-
-function SourceBadge({ source }) {
-  if (!source) return null;
-  
-  const sourceConfig = {
-    'credential_test': { 
-      label: '🔑 Credentials', 
-      className: 'badge--cred',
-      color: '#FF2D55' 
-    },
-    'nuclei': { 
-      label: '🔍 Nuclei', 
-      className: 'badge--nuclei',
-      color: '#00E5FF' 
-    },
-    'nvd': { 
-      label: '🌐 NVD', 
-      className: 'badge--nvd',
-      color: '#B500FF' 
-    }
-  };
-  
-  const config = sourceConfig[source] || { label: source, className: '', color: '#94A3B8' };
-  
+function TabButton({ active, label, onClick, count }) {
   return (
-    <span 
-      className={`badge badge--source ${config.className}`}
-      style={{ 
-        borderColor: config.color,
-        color: config.color,
-        boxShadow: `0 0 8px ${config.color}40`
-      }}
-      title={`Source: ${source}`}
+    <button
+      onClick={onClick}
+      className={`tab-btn ${active ? 'tab-btn--active' : ''}`}
     >
-      {config.label}
-    </span>
+      {label} {count !== undefined && <span className="tab-count">{count}</span>}
+    </button>
   );
 }
 
-function CvssBar({ score }) {
-  if (score == null) return <span className="unknown-val"><em>N/A</em></span>;
-  const pct = Math.min(100, (score / 10) * 100);
-  const color = score >= 9 ? '#DC2626' : score >= 7 ? '#EA580C' : score >= 4 ? '#CA8A04' : '#2563EB';
+function Section({ title, children }) {
   return (
-    <div className="cvss-bar-wrap">
-      <div className="cvss-bar">
-        <div className="cvss-bar__fill" style={{ width: `${pct}%`, background: color }} />
-      </div>
-      <span className="cvss-score">{score.toFixed(1)}</span>
+    <div className="detail-section">
+      <h4 className="detail-section__title">{title}</h4>
+      {children}
     </div>
   );
 }
 
-function DescriptionCell({ text }) {
-  const [expanded, setExpanded] = useState(false);
-  if (!text) return <UnknownVal value={null} />;
-  const short = text.length > 120;
+function InfoGrid({ items }) {
   return (
-    <span>
-      {expanded || !short ? text : text.slice(0, 120) + '…'}
-      {short && (
-        <button className="see-more-btn" onClick={() => setExpanded(e => !e)}>
-          {expanded ? ' voir moins' : ' voir plus'}
-        </button>
-      )}
-    </span>
+    <div className="info-grid">
+      {items.map(([label, value], i) => (
+        <div key={i} className="info-item">
+          <div className="info-label">{label}</div>
+          <div className="info-value">{value || <span className="unknown-text">Inconnu</span>}</div>
+        </div>
+      ))}
+    </div>
   );
 }
 
 export default function HostDetailPanel({ host }) {
-  const services = host.services ?? [];
-  const vulns    = host.vulnerabilities ?? [];
+  const [tab, setTab] = useState('overview');
+  const vulns = host.vulnerabilities || [];
+  const services = host.services || [];
+  const apps = host.running_applications || [];
 
-  // Sort vulns by severity weight descending
-  const sortedVulns = [...vulns].sort((a, b) =>
-    (SEV_WEIGHTS[(b.severity||'').toLowerCase()] ?? 0) -
-    (SEV_WEIGHTS[(a.severity||'').toLowerCase()] ?? 0)
-  );
+  const criticalVulns = vulns.filter(v => v.severity === 'critical');
+  const highVulns = vulns.filter(v => v.severity === 'high');
 
   return (
     <div className="detail-panel">
-      {/* ── Host summary strip ── */}
-      <div className="detail-panel__summary">
-        <div className="detail-summary-item">
-          <span className="detail-summary-label">IP</span>
-          <code>{host.ip}</code>
+      <div className="detail-panel__header">
+        <div>
+          <h3>{host.device_classification || 'Unknown Device'}</h3>
+          <p className="detail-sub">{host.ip} {host.ipv6 ? `· IPv6: ${host.ipv6}` : ''} {host.mac_address !== 'Unknown' ? `· MAC: ${host.mac_address}` : ''}</p>
         </div>
-        <div className="detail-summary-item">
-          <span className="detail-summary-label">Hostname</span>
-          <UnknownVal value={host.hostname} />
-        </div>
-        <div className="detail-summary-item">
-          <span className="detail-summary-label">OS</span>
-          <UnknownVal value={host.os} />
-        </div>
-        <div className="detail-summary-item">
-          <span className="detail-summary-label">MAC</span>
-          <UnknownVal value={host.mac_address} />
-        </div>
-        <div className="detail-summary-item">
-          <span className="detail-summary-label">Status</span>
-          <span className="status-dot-wrap">
-            <span className="status-dot status-dot--up" />
-            {host.status || 'up'}
-          </span>
+        <div className="detail-badges">
+          {host.is_gateway && <span className="badge badge--gateway">🌐 Gateway</span>}
+          {host.is_local_machine && <span className="badge badge--local">💻 This Machine</span>}
+          {host.is_vm && <span className="badge badge--vm">VM</span>}
+          {host.is_docker && <span className="badge badge--docker">Docker</span>}
+          {host.is_wsl && <span className="badge badge--wsl">WSL</span>}
         </div>
       </div>
 
-      {/* ── Services table ── */}
-      <div className="detail-section">
-        <h4 className="detail-section__title">
-          🔌 Services &amp; Ports ouverts
-          <span className="detail-count">{services.length}</span>
-        </h4>
-        {services.length === 0 ? (
-          <p className="detail-empty">Aucun port ouvert détecté sur cet appareil.</p>
-        ) : (
-          <div className="table-wrap">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Port</th>
-                  <th>Protocole</th>
-                  <th>Service</th>
-                  <th>Version</th>
-                  <th>État</th>
-                </tr>
-              </thead>
-              <tbody>
-                {services.map((s, i) => (
-                  <tr key={i}>
-                    <td><code className="port-code">{s.port}</code></td>
-                    <td><span className="proto-badge">{s.protocol || 'tcp'}</span></td>
-                    <td><UnknownVal value={s.name} /></td>
-                    <td><UnknownVal value={s.version} /></td>
-                    <td>
-                      <span className={`state-badge state-badge--${(s.state || 'open').toLowerCase()}`}>
-                        {s.state || 'open'}
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      {(host.risk_score > 0 || criticalVulns.length > 0) && (
+        <motion.div className="risk-banner" initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}>
+          <div className="risk-banner__score">{Math.round(host.risk_score || 0)}</div>
+          <div>
+            <div className="risk-banner__title">Risk Score: {host.criticality || 'Unknown'}</div>
+            <div className="risk-banner__stats">
+              {criticalVulns.length} Critical · {highVulns.length} High · {vulns.length} Total
+            </div>
           </div>
+        </motion.div>
+      )}
+
+      <div className="tab-bar">
+        <TabButton active={tab === 'overview'} label="Overview" onClick={() => setTab('overview')} />
+        <TabButton active={tab === 'network'} label="Network" onClick={() => setTab('network')} />
+        <TabButton active={tab === 'services'} label="Services" count={services.length} onClick={() => setTab('services')} />
+        <TabButton active={tab === 'vulns'} label="Vulnerabilities" count={vulns.length} onClick={() => setTab('vulns')} />
+        <TabButton active={tab === 'apps'} label="Apps" count={apps.length} onClick={() => setTab('apps')} />
+        {host.evidence && host.evidence.length > 0 && (
+          <TabButton active={tab === 'evidence'} label="Evidence" count={host.evidence.length} onClick={() => setTab('evidence')} />
         )}
       </div>
 
-      {/* ── Vulnerabilities table ── */}
-      <div className="detail-section">
-        <h4 className="detail-section__title">
-          🛡️ Vulnérabilités
-          <span className="detail-count">{vulns.length}</span>
-        </h4>
-        {sortedVulns.length === 0 ? (
-          <p className="detail-empty">✅ Aucune vulnérabilité détectée sur cet appareil.</p>
-        ) : (
+      <div className="tab-content">
+        {tab === 'overview' && (
+          <>
+            <Section title="Host Identity">
+              <InfoGrid items={[
+                ['Hostname', host.hostname],
+                ['Source', host.hostname_source],
+                ['Confidence', `${Math.round((host.hostname_confidence || 0) * 100)}%`],
+                ['Device Type', host.device_type],
+                ['Classification', host.device_classification],
+                ['Manufacturer', host.manufacturer],
+                ['OS', host.os],
+                ['OS Family', host.os_family],
+                ['OS Version', host.os_version],
+                ['OS Confidence', host.os_confidence],
+                ['Architecture', host.architecture],
+                ['Uptime', host.uptime],
+              ]} />
+            </Section>
+            <Section title="Audit Metadata">
+              <InfoGrid items={[
+                ['Audit Status', host.audit_status],
+                ['Last Scan', host.last_scan ? new Date(host.last_scan).toLocaleString() : 'N/A'],
+                ['Discovery Method', host.discovery_method],
+                ['Scanned', host.scanned ? 'Yes' : 'No'],
+              ]} />
+            </Section>
+          </>
+        )}
+
+        {tab === 'network' && (
+          <Section title="Network Identity">
+            <InfoGrid items={[
+              ['IPv4', host.ip],
+              ['IPv6', host.ipv6],
+              ['MAC Address', host.mac_address],
+              ['MAC Vendor', host.mac_vendor],
+              ['Network Interface', host.network_interface],
+              ['Is Gateway', host.is_gateway ? 'Yes' : 'No'],
+              ['Is Local Machine', host.is_local_machine ? 'Yes' : 'No'],
+              ['Is VM', host.is_vm ? 'Yes' : 'No'],
+              ['Is Docker', host.is_docker ? 'Yes' : 'No'],
+              ['Is WSL', host.is_wsl ? 'Yes' : 'No'],
+            ]} />
+          </Section>
+        )}
+
+        {tab === 'services' && (
           <div className="table-wrap">
-            <table className="data-table vuln-table">
-              <thead>
-                <tr>
-                  <th>Sévérité</th>
-                  <th>Source</th>
-                  <th>CVE / Template</th>
-                  <th>Nom</th>
-                  <th>CVSS</th>
-                  <th>Matcher</th>
-                  <th>Description</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sortedVulns.map((v, i) => {
-                  const sev = (v.severity || 'info').toLowerCase();
-                  const isCredTest = v.source === 'credential_test';
-                  const isExposureOnly = v.template_id?.startsWith('exposure-');
-                  
-                  return (
-                    <tr
-                      key={i}
-                      className={isCredTest ? 'vuln-row--cred' : ''}
-                      style={{ 
-                        borderLeft: `3px solid var(--color-${sev === 'safe' ? 'safe' : sev})`,
-                        background: isCredTest ? 'rgba(255, 45, 85, 0.05)' : undefined
-                      }}
-                    >
-                      <td><SevBadge sev={v.severity} /></td>
-                      <td><SourceBadge source={v.source} /></td>
-                      <td>
-                        {v.cve_id ? (
-                          <a
-                            href={`https://nvd.nist.gov/vuln/detail/${v.cve_id}`}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="cve-link"
-                          >
-                            {v.cve_id}
-                          </a>
-                        ) : (
-                          <span className="template-id">{v.template_id || '—'}</span>
-                        )}
-                      </td>
-                      <td className="vuln-name">
-                        {v.name || '—'}
-                        {isCredTest && !isExposureOnly && (
-                          <span className="cred-indicator">⚠️</span>
-                        )}
-                      </td>
-                      <td><CvssBar score={v.cvss_score} /></td>
-                      <td>
-                        <UnknownVal value={v.matcher_name} />
-                      </td>
-                      <td className="vuln-desc">
-                        <DescriptionCell text={v.description} />
-                      </td>
+            {services.length === 0 ? (
+              <p className="empty-message">No services detected.</p>
+            ) : (
+              <table className="data-table">
+                <thead>
+                  <tr><th>Port</th><th>Protocol</th><th>Service</th><th>Version</th><th>Banner</th></tr>
+                </thead>
+                <tbody>
+                  {services.map((s, i) => (
+                    <tr key={i}>
+                      <td><code className="port-code">{s.port}</code></td>
+                      <td><span className="proto-badge">{s.protocol}</span></td>
+                      <td>{s.name}</td>
+                      <td>{s.version}</td>
+                      <td className="banner-cell">{s.banner || '—'}</td>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+
+        {tab === 'vulns' && (
+          <div className="vuln-list">
+            {vulns.length === 0 ? (
+              <p className="empty-message">No vulnerabilities detected.</p>
+            ) : (
+              vulns.map((v, i) => (
+                <motion.div
+                  key={i}
+                  className={`vuln-card ${v.source === 'credential_test' ? 'vuln-card--cred' : ''}`}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ delay: i * 0.03 }}
+                  style={{ borderLeftColor: SEV_COLOR[v.severity] || 'var(--color-text-muted)' }}
+                >
+                  <div className="vuln-card__header">
+                    <div className="vuln-card__name">{v.name}</div>
+                    <div className="vuln-card__meta">
+                      <span className="severity-badge" style={{ background: `${SEV_COLOR[v.severity]}20`, color: SEV_COLOR[v.severity] }}>
+                        {v.severity}
+                      </span>
+                      {v.cvss_score && <span className="cvss-score">CVSS: {v.cvss_score}{v.cvss_estimated ? '*' : ''}</span>}
+                      {v.exploit_available && <span className="exploit-badge">⚡ EXPLOIT</span>}
+                    </div>
+                  </div>
+                  <div className="vuln-card__details">
+                    {v.cve_id && <span className="cve-id">{v.cve_id}</span>}
+                    <span className="vuln-source">Source: {v.source} · Matcher: {v.matcher_name}</span>
+                  </div>
+                  {v.description && <p className="vuln-desc">{v.description}</p>}
+                  {v.remediation && (
+                    <div className="remediation-box">
+                      <strong>Remediation:</strong> {v.remediation}
+                    </div>
+                  )}
+                  {v.references && v.references.length > 0 && (
+                    <div className="refs">Refs: {v.references.join(', ')}</div>
+                  )}
+                </motion.div>
+              ))
+            )}
+          </div>
+        )}
+
+        {tab === 'apps' && (
+          <div className="apps-grid">
+            {apps.length === 0 ? (
+              <p className="empty-message">No applications detected.</p>
+            ) : (
+              apps.map((app, i) => (
+                <div key={i} className="app-chip">
+                  <span className="app-name">{app.name}</span>
+                  <span className="app-version">v{app.version}</span>
+                  <span className="app-port">{app.port}/{app.protocol}</span>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {tab === 'evidence' && host.evidence && (
+          <div className="evidence-list">
+            {host.evidence.map((ev, i) => {
+              if (ev.type === 'web_screenshot' || ev.type === 'auth_screenshot') {
+                const pathClean = ev.path
+                  .replace(/\\/g, '/')
+                  .split('data/screenshots/')
+                  .pop();
+                const imgSrc = `http://localhost:8000/screenshots/${pathClean}`;
+                return (
+                  <div key={i} className="evidence-item">
+                    <div className="evidence-item__title">
+                      {ev.type === 'web_screenshot' ? '📷' : '🔑'} {ev.label || 'Screenshot Proof'}
+                    </div>
+                    <div className="evidence-item__image-wrap">
+                      <a href={imgSrc} target="_blank" rel="noreferrer">
+                        <img src={imgSrc} alt={ev.label} className="evidence-image" />
+                      </a>
+                    </div>
+                  </div>
+                );
+              } else if (ev.type === 'text') {
+                return (
+                  <div key={i} className="evidence-item">
+                    <div className="evidence-item__title">🖥 {ev.label || 'Connection Proof'}</div>
+                    <pre className="evidence-terminal"><code>{ev.content}</code></pre>
+                  </div>
+                );
+              }
+              return null;
+            })}
           </div>
         )}
       </div>

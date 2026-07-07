@@ -180,6 +180,8 @@ async def generate_pdf_report(scan_id: str) -> bytes:
             "os": h.os or "Unknown",
             "mac_address": h.mac_address or "Unknown",
             "scanned": len(h.services) > 0,
+            "screenshot_path": h.screenshot_path,
+            "evidence": h.evidence or [],
             "services": [
                 {"port": s.port, "protocol": s.protocol, "name": s.name, "version": s.version, "state": s.state}
                 for s in h.services
@@ -1921,6 +1923,103 @@ async def generate_pdf_report(scan_id: str) -> bytes:
             ]))
             host_elements.append(vuln_table)
         
+        # ── Evidence Blocks ───────────────────────────────────────────────────
+        evidence_items = h.get("evidence", [])
+        web_screenshots = [e for e in evidence_items if e.get("type") == "web_screenshot"]
+        auth_screenshots = [e for e in evidence_items if e.get("type") == "auth_screenshot"]
+        text_evidences = [e for e in evidence_items if e.get("type") == "text"]
+
+        if evidence_items:
+            host_elements.append(Spacer(1, 10))
+            host_elements.append(Paragraph("<b>Preuves Capturées</b>", h3_style))
+
+        # Web Screenshots
+        for ev in web_screenshots:
+            ev_path = ev.get("path")
+            ev_label = ev.get("label", "Capture écran web")
+            if ev_path:
+                import os
+                if os.path.exists(ev_path):
+                    try:
+                        img = Image(ev_path, width=6.5*inch, height=3.5*inch)
+                        img.hAlign = 'LEFT'
+                        label_box = Table(
+                            [[Paragraph(f"<b>📷 {ev_label}</b>",
+                                ParagraphStyle('EvidenceLabel', parent=body_style,
+                                    textColor=PDF_COLORS['primary'], fontSize=9))]],
+                            colWidths=[7.5*inch]
+                        )
+                        label_box.setStyle(TableStyle([
+                            ('BACKGROUND', (0,0), (-1,-1), PDF_COLORS['bg_light']),
+                            ('PADDING', (0,0), (-1,-1), 6),
+                            ('LINELEFT', (0,0), (-1,-1), 3, PDF_COLORS['primary']),
+                        ]))
+                        host_elements.append(label_box)
+                        host_elements.append(img)
+                        host_elements.append(Spacer(1, 8))
+                    except Exception:
+                        pass
+
+        # Auth Screenshots
+        for ev in auth_screenshots:
+            ev_path = ev.get("path")
+            ev_label = ev.get("label", "Preuve d'authentification")
+            if ev_path:
+                import os
+                if os.path.exists(ev_path):
+                    try:
+                        img = Image(ev_path, width=6.5*inch, height=3.5*inch)
+                        img.hAlign = 'LEFT'
+                        label_box = Table(
+                            [[Paragraph(f"<b>🔑 {ev_label}</b>",
+                                ParagraphStyle('AuthEvidenceLabel', parent=body_style,
+                                    textColor=PDF_COLORS['critical'], fontSize=9))]],
+                            colWidths=[7.5*inch]
+                        )
+                        label_box.setStyle(TableStyle([
+                            ('BACKGROUND', (0,0), (-1,-1), PDF_COLORS['bg_critical_tint']),
+                            ('PADDING', (0,0), (-1,-1), 6),
+                            ('LINELEFT', (0,0), (-1,-1), 3, PDF_COLORS['critical']),
+                        ]))
+                        host_elements.append(label_box)
+                        host_elements.append(img)
+                        host_elements.append(Spacer(1, 8))
+                    except Exception:
+                        pass
+
+        # Text Evidence (SSH/FTP/SMB session output)
+        for ev in text_evidences:
+            ev_content = ev.get("content", "")
+            ev_label = ev.get("label", "Preuve de Connexion (texte)")
+            if ev_content:
+                label_box = Table(
+                    [[Paragraph(f"<b>🖥 {ev_label}</b>",
+                        ParagraphStyle('TextEvidenceLabel', parent=body_style,
+                            textColor=colors.HexColor('#92400E'), fontSize=9))]],
+                    colWidths=[7.5*inch]
+                )
+                label_box.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#FEF3C7')),
+                    ('PADDING', (0,0), (-1,-1), 6),
+                    ('LINELEFT', (0,0), (-1,-1), 3, colors.HexColor('#F59E0B')),
+                ]))
+                host_elements.append(label_box)
+
+                terminal_box = Table(
+                    [[Paragraph(ev_content.replace('\n', '<br/>'),
+                        ParagraphStyle('TerminalStyle', parent=mono_style,
+                            backColor=colors.HexColor('#1E293B'),
+                            textColor=colors.HexColor('#86EFAC'),
+                            fontSize=8, leading=12))]],
+                    colWidths=[7.5*inch]
+                )
+                terminal_box.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#1E293B')),
+                    ('PADDING', (0,0), (-1,-1), 10),
+                ]))
+                host_elements.append(terminal_box)
+                host_elements.append(Spacer(1, 8))
+
         story.append(KeepTogether(host_elements))
         story.append(Spacer(1, 25))
         
@@ -1940,7 +2039,7 @@ async def generate_pdf_report(scan_id: str) -> bytes:
             priority = r.get('priority', idx)
             theme = r.get('theme', 'Sans thème')
             advice = r.get('advice', 'Aucun conseil disponible')
-            
+
             # Priority color
             if priority == 1:
                 prio_color = PDF_COLORS["critical"]
@@ -1954,23 +2053,90 @@ async def generate_pdf_report(scan_id: str) -> bytes:
             else:
                 prio_color = PDF_COLORS["low"]
                 prio_label = "FAIBLE"
-            
-            # Recommendation Box
-            rec_header = f"<b>#{priority} - {theme.upper()}</b> <font color='{prio_color.hexval()}'>({prio_label})</font>"
-            rec_content = f"""
-            {rec_header}<br/>
-            <br/>
-            {advice}
-            """
-            r_table = Table([[Paragraph(rec_content, body_style)]], colWidths=[7.5*inch])
-            r_table.setStyle(TableStyle([
+
+            # Recommendation Header
+            r_header = Table(
+                [[Paragraph(f"<b>#{priority} — {theme.upper()}</b> "
+                            f"<font color='{prio_color.hexval()}'>[{prio_label}]</font>",
+                            h3_style)]],
+                colWidths=[7.5*inch]
+            )
+            r_header.setStyle(TableStyle([
                 ('BACKGROUND', (0,0), (-1,-1), PDF_COLORS["bg_light"]),
-                ('PADDING', (0,0), (-1,-1), 16),
+                ('PADDING', (0,0), (-1,-1), 10),
                 ('LINELEFT', (0,0), (-1,-1), 6, prio_color),
                 ('LINETOP', (0,0), (-1,-1), 2, prio_color),
-                ('VALIGN', (0,0), (-1,-1), 'TOP'),
             ]))
-            story.append(r_table)
+            story.append(r_header)
+
+            # Parse the four sections from the advice text
+            import re as _re
+            def _extract(label, text):
+                pattern = rf'\*\*{_re.escape(label)}\*\*[:\s]*(.*?)(?=\*\*[A-ZÉà-ÿ]|$)'
+                m = _re.search(pattern, text, _re.DOTALL | _re.IGNORECASE)
+                return m.group(1).strip() if m else None
+
+            what = _extract('Ce que cela signifie', advice)
+            where = _extract('Où', advice)
+            how_fix = _extract('Comment corriger', advice)
+            how_verify = _extract('Comment vérifier', advice)
+
+            if any([what, where, how_fix, how_verify]):
+                # Section: Ce que cela signifie
+                if what:
+                    box = Table([[Paragraph(f"<b>💡 Ce que cela signifie :</b><br/>{what}", body_style)]], colWidths=[7.5*inch])
+                    box.setStyle(TableStyle([
+                        ('BACKGROUND', (0,0), (-1,-1), PDF_COLORS['bg_light']),
+                        ('PADDING', (0,0), (-1,-1), 12),
+                        ('LINELEFT', (0,0), (-1,-1), 4, PDF_COLORS['primary']),
+                    ]))
+                    story.append(box)
+                    story.append(Spacer(1, 4))
+
+                # Section: Où
+                if where:
+                    box = Table([[Paragraph(f"<b>📍 Où :</b> {where}", body_style)]], colWidths=[7.5*inch])
+                    box.setStyle(TableStyle([
+                        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#F0FDF4')),
+                        ('PADDING', (0,0), (-1,-1), 10),
+                        ('LINELEFT', (0,0), (-1,-1), 4, PDF_COLORS['safe']),
+                    ]))
+                    story.append(box)
+                    story.append(Spacer(1, 4))
+
+                # Section: Comment corriger
+                if how_fix:
+                    steps = [s.strip() for s in how_fix.split('\n') if s.strip()]
+                    step_content = '<br/>'.join(steps)
+                    box = Table([[Paragraph(f"<b>🔧 Comment corriger :</b><br/>{step_content}", body_style)]], colWidths=[7.5*inch])
+                    box.setStyle(TableStyle([
+                        ('BACKGROUND', (0,0), (-1,-1), PDF_COLORS['bg_high_tint']),
+                        ('PADDING', (0,0), (-1,-1), 12),
+                        ('LINELEFT', (0,0), (-1,-1), 4, PDF_COLORS['high']),
+                    ]))
+                    story.append(box)
+                    story.append(Spacer(1, 4))
+
+                # Section: Comment vérifier
+                if how_verify:
+                    box = Table([[Paragraph(f"<b>✅ Comment vérifier :</b><br/>{how_verify}", body_style)]], colWidths=[7.5*inch])
+                    box.setStyle(TableStyle([
+                        ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#F0FDF4')),
+                        ('PADDING', (0,0), (-1,-1), 10),
+                        ('LINELEFT', (0,0), (-1,-1), 4, PDF_COLORS['safe']),
+                    ]))
+                    story.append(box)
+            else:
+                # Fallback: render raw advice text
+                r_table = Table([[Paragraph(advice, body_style)]], colWidths=[7.5*inch])
+                r_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,-1), PDF_COLORS["bg_light"]),
+                    ('PADDING', (0,0), (-1,-1), 12),
+                    ('LINELEFT', (0,0), (-1,-1), 4, prio_color),
+                    ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                ]))
+                story.append(r_table)
+
             story.append(Spacer(1, 15))
             
     story.append(Spacer(1, 25))

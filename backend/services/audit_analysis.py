@@ -74,8 +74,8 @@ Respond ONLY in valid JSON with EXACTLY this structure:
   "strategic_recommendations": [
     {
       "priority": 1,
-      "theme": "Recommendation theme (e.g., Access Management)",
-      "advice": "Global recommendation to prevent these vulnerabilities from recurring."
+      "theme": "Thème de la recommandation (ex. Gestion des Accès)",
+      "advice": "[REQUIRED FORMAT — follow exactly] **Ce que cela signifie :** [plain-language 1-sentence risk description, no jargon]\n**Où :** [exact IP, hostname if known, port/service]\n**Comment corriger :**\n1. [step 1 — GUI path or exact command with explanation]\n2. [step 2]\n3. [step 3]\n**Comment vérifier :** [simple confirmation test a non-expert can perform]"
     }
   ],
   "overall_verdict": "One impactful sentence summarizing the audit conclusion."
@@ -85,8 +85,13 @@ STRICT RULES:
 1. "key_findings": Detail the 5 most critical vulnerabilities. "remediation_steps" MUST be clear and sequential actions.
 2. If default credentials were validated, this is ALWAYS finding #1.
 3. DO NOT invent ANY vulnerability. Base your analysis ONLY on the provided context.
-4. Write in professional English without fluff.
-5. Provide detailed paragraphs, not one-line summaries."""
+4. The "strategic_recommendations" "advice" field MUST be written in FRENCH and follow the EXACT structure: **Ce que cela signifie :** / **Où :** / **Comment corriger :** (numbered steps) / **Comment vérifier :**
+5. Provide detailed paragraphs, not one-line summaries.
+6. For every "Comment corriger" step that requires a terminal command, write the EXACT command on its own line and explain in one sentence what it does.
+
+Example of a complete "advice" value:
+"**Ce que cela signifie :** N'importe qui sur ce réseau peut actuellement consulter les fichiers partagés de cet ordinateur sans mot de passe.\n**Où :** 192.168.1.14 (COMPTA-PC) sur le port 445 (SMB)\n**Comment corriger :**\n1. Ouvrez le Panneau de Configuration → Réseau et Internet → Centre Réseau et Partage → Modifier les paramètres de partage avancés.\n2. Sous 'Partage protégé par mot de passe', cochez 'Activer le partage protégé par mot de passe' puis cliquez Enregistrer.\n3. Ouvrez PowerShell en tant qu'Administrateur et exécutez :\n   Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force\n   (Ceci désactive une version obsolète et vulnérable du protocole de partage Windows.)\n4. Redémarrez l'ordinateur pour appliquer les changements.\n**Comment vérifier :** Depuis un autre ordinateur, tapez \\\\192.168.1.14 dans l'Explorateur de fichiers ; une fenêtre de connexion doit s'afficher et bloquer tout accès sans mot de passe."
+"""
 
 
 # ── Data Fetchers ─────────────────────────────────────────────────────────────
@@ -404,34 +409,84 @@ def build_fallback_analysis(context: dict) -> dict:
     priority_counter = 1
 
     if has_weak_creds:
+        affected_hosts_str = ", ".join(
+            set(cred.get("host_ip", "inconnu") for cred in context.get("working_credentials", []))
+        )
         strategic_recs.append({
             "priority": priority_counter,
-            "theme": "Credential Management",
-            "advice": "Implement a comprehensive credential management policy. Eliminate all default credentials, enforce strong password policies, and implement multi-factor authentication for all critical services."
+            "theme": "Gestion des Identifiants par Défaut",
+            "advice": (
+                f"**Ce que cela signifie :** Des identifiants par défaut ou très simples sont utilisés sur vos équipements, "
+                f"permettant à un attaquant de prendre le contrôle total à distance sans effort.\n"
+                f"**Où :** Hôtes concernés : {affected_hosts_str}\n"
+                f"**Comment corriger :**\n"
+                f"1. Connectez-vous à l'interface d'administration de chaque appareil listé ci-dessus.\n"
+                f"2. Accédez à la section 'Paramètres de sécurité' ou 'Gestion des utilisateurs'.\n"
+                f"3. Changez le mot de passe par un mot de passe fort (minimum 12 caractères, avec majuscules, chiffres et symboles).\n"
+                f"4. Si le service le permet, désactivez le compte 'admin' par défaut et créez un nouveau compte administrateur avec un nom unique.\n"
+                f"5. Redémarrez le service ou l'équipement pour appliquer les changements.\n"
+                f"**Comment vérifier :** Essayez de vous connecter avec l'ancien identifiant par défaut (ex. admin/admin) ; l'accès doit être refusé."
+            )
         })
         priority_counter += 1
 
     if crit_count > 0:
+        crit_hosts_str = ", ".join(
+            set(h["ip"] for h in context.get("hosts_summary", []) if h["critical_count"] > 0)
+        )
         strategic_recs.append({
             "priority": priority_counter,
-            "theme": "Vulnerability Management",
-            "advice": f"Immediately address {crit_count} critical vulnerabilities. Establish a patch management process to ensure timely remediation of security issues."
+            "theme": "Correction des Vulnérabilités Critiques",
+            "advice": (
+                f"**Ce que cela signifie :** Votre réseau contient {crit_count} vulnérabilité(s) de niveau critique. "
+                f"Un attaquant peut les exploiter pour pirater vos machines à distance, sans avoir besoin d'identifiants.\n"
+                f"**Où :** Hôtes concernés : {crit_hosts_str}\n"
+                f"**Comment corriger :**\n"
+                f"1. Sur Windows : cliquez sur Démarrer → Paramètres → Windows Update → Rechercher des mises à jour. Installez toutes les mises à jour disponibles.\n"
+                f"2. Sur Linux : ouvrez un terminal et exécutez :\n"
+                f"   sudo apt update && sudo apt upgrade -y\n"
+                f"   (Ceci télécharge et installe toutes les dernières corrections de sécurité.)\n"
+                f"3. Si un service spécifique est vulnérable, téléchargez la dernière version depuis le site officiel et réinstallez-le.\n"
+                f"4. Si la mise à jour est impossible immédiatement, bloquez l'accès externe au port vulnérable via votre pare-feu.\n"
+                f"**Comment vérifier :** Relancez un audit de sécurité ; les alertes critiques doivent avoir disparu."
+            )
         })
         priority_counter += 1
 
     if high_count > 0:
+        high_hosts_str = ", ".join(
+            set(h["ip"] for h in context.get("hosts_summary", []) if h["high_count"] > 0)
+        )
         strategic_recs.append({
             "priority": priority_counter,
-            "theme": "Security Hardening",
-            "advice": f"Plan remediation for {high_count} high-severity vulnerabilities within the next 7 days. Prioritize based on business impact and exploitability."
+            "theme": "Durcissement de la Sécurité",
+            "advice": (
+                f"**Ce que cela signifie :** {high_count} vulnérabilité(s) de niveau élevé ont été détectées. "
+                f"Elles représentent des points d'entrée significatifs pour un attaquant motivé.\n"
+                f"**Où :** Hôtes concernés : {high_hosts_str}\n"
+                f"**Comment corriger :**\n"
+                f"1. Appliquez les mises à jour de sécurité pour tous les services listés dans les vulnérabilités.\n"
+                f"2. Désactivez les services non essentiels : ouvrez les Services Windows (services.msc) et mettez sur 'Désactivé' tout service que vous n'utilisez pas.\n"
+                f"3. Configurez un pare-feu pour limiter l'accès aux ports concernés uniquement aux adresses IP autorisées.\n"
+                f"**Comment vérifier :** Relancez un scan dans 7 jours pour confirmer que le nombre de vulnérabilités élevées a diminué."
+            )
         })
         priority_counter += 1
 
     if not strategic_recs:
         strategic_recs.append({
             "priority": 1,
-            "theme": "Continuous Monitoring",
-            "advice": "Maintain regular security scanning and monitoring. Implement a vulnerability management program to track and remediate issues as they arise."
+            "theme": "Surveillance Continue",
+            "advice": (
+                "**Ce que cela signifie :** Aucune vulnérabilité critique n'a été détectée lors de cet audit. "
+                "Cela signifie que votre réseau est dans un état de sécurité acceptable pour le moment.\n"
+                "**Où :** Ensemble du réseau scanné.\n"
+                "**Comment corriger :**\n"
+                "1. Maintenez vos systèmes à jour en vérifiant les mises à jour au moins une fois par semaine.\n"
+                "2. Planifiez un prochain audit de sécurité dans les 30 prochains jours pour détecter toute nouvelle vulnérabilité.\n"
+                "3. Assurez-vous que vos sauvegardes de données sont fonctionnelles et testées régulièrement.\n"
+                "**Comment vérifier :** Relancez un audit périodiquement pour confirmer que le niveau de sécurité reste stable."
+            )
         })
 
     return {
