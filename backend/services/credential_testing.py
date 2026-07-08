@@ -111,13 +111,14 @@ async def set_cached_cred_result(ip: str, port: int, service: str, result: Dict)
 # DEFAULT CREDENTIALS WORDLIST
 # =============================================================================
 DEFAULT_CREDENTIALS = {
-    "ftp": [("anonymous", "anonymous"), ("ftp", "ftp"), ("admin", "admin"), ("admin", "password")],
-    "ssh": [("root", "root"), ("admin", "admin"), ("root", "toor"), ("admin", "password")],
-    "telnet": [("admin", "admin"), ("root", "root"), ("admin", ""), ("root", "")],
+    "ftp": [("anonymous", "anonymous"), ("ftp", "ftp"), ("msfadmin", "msfadmin"), ("admin", "admin"), ("admin", "password")],
+    "ssh": [("root", "root"), ("msfadmin", "msfadmin"), ("admin", "admin"), ("root", "toor"), ("admin", "password"), ("pi", "raspberry")],
+    "telnet": [("admin", "admin"), ("msfadmin", "msfadmin"), ("root", "root"), ("admin", ""), ("root", "")],
     "smb": [("admin", "admin"), ("guest", ""), ("administrator", "password")],
     "mysql": [("root", ""), ("root", "root"), ("root", "password")],
     "postgresql": [("postgres", "postgres"), ("postgres", "password"), ("postgres", "")],
 }
+
 
 
 # =============================================================================
@@ -270,25 +271,38 @@ async def test_telnet_credentials(ip: str, port: int = 23) -> Dict:
     for username, password in DEFAULT_CREDENTIALS["telnet"]:
         result["attempts_made"] += 1
         try:
-            def _try_login():
-                # Telnet connection attempt with timeout
-                reader, writer = asyncio.run_coroutine_threadsafe(
-                    telnetlib3.open_connection(ip, port, timeout=5),
-                    asyncio.get_event_loop()
-                ).result(timeout=5)
+            # Fully async telnet login using telnetlib3
+            reader, writer = await asyncio.wait_for(
+                telnetlib3.open_connection(ip, port),
+                timeout=5
+            )
+            
+            # Send username
+            writer.write(f"{username}\n")
+            await asyncio.wait_for(writer.drain(), timeout=3)
+            await asyncio.sleep(0.5)
+            
+            # Send password
+            writer.write(f"{password}\n")
+            await asyncio.wait_for(writer.drain(), timeout=3)
+            await asyncio.sleep(0.5)
+            
+            # Read response to check for failure
+            success = True
+            try:
+                data = await asyncio.wait_for(reader.read(1024), timeout=2)
+                if any(x in data.lower() for x in ["login incorrect", "fail", "invalid", "incorrect", "login:"]):
+                    success = False
+            except asyncio.TimeoutError:
+                # Timeout implies connection remains open and didn't immediately reject us
+                pass
                 
-                # Basic login attempt (implementation varies by telnet server)
-                # This is a simplified check - real telnet login handling is complex
-                writer.write(f"{username}\n".encode())
-                asyncio.run_coroutine_threadsafe(writer.drain(), asyncio.get_event_loop()).result(timeout=5)
-                writer.write(f"{password}\n".encode())
-                asyncio.run_coroutine_threadsafe(writer.drain(), asyncio.get_event_loop()).result(timeout=5)
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=2)
+            except Exception:
+                pass
                 
-                writer.close()
-                asyncio.run_coroutine_threadsafe(writer.wait_closed(), asyncio.get_event_loop()).result(timeout=5)
-                return True
-
-            success = await asyncio.to_thread(_try_login)
             if success:
                 result["vulnerable"] = True
                 result["credentials_found"].append({"username": username, "password": password})

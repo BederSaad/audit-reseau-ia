@@ -62,6 +62,14 @@ async def build_priority_list(scan_id: str) -> List[Dict]:
         )
         hosts = res.scalars().unique().all()
     
+    severity_fr_map = {
+        "critical": "Critique",
+        "high": "Élevé",
+        "medium": "Moyen",
+        "low": "Faible",
+        "info": "Info",
+    }
+    
     priorities = []
     for h in hosts:
         for v in h.vulnerabilities:
@@ -71,12 +79,15 @@ async def build_priority_list(scan_id: str) -> List[Dict]:
             else:
                 urgency = SEVERITY_WEIGHTS.get(v.severity.lower(), 0) * 3
             
+            sev_lower = (v.severity or "info").lower()
+            risk_cat = severity_fr_map.get(sev_lower, sev_lower.capitalize())
+            
             priorities.append({
                 "host_ip": h.ip,
                 "name": v.name,
                 "severity": v.severity,
                 "cvss_score": v.cvss_score,
-                "risk_category": v.severity.upper(),
+                "risk_category": risk_cat,
                 "urgency_score": min(100, round(urgency, 1)),
                 "source": v.source,
                 "template_id": v.template_id,

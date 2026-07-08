@@ -1921,6 +1921,12 @@ async def run_pipeline(scan_id: str, target: str) -> None:
                         )
                         hr["evidence"].append(text_ev)
 
+        # Convert raw credential results to proper vulnerability dicts for DB/scoring/enrichment
+        for hr in host_results:
+            raw_creds = hr.get("cred_vulns", [])
+            converted = credential_results_to_vulnerabilities(None, raw_creds)
+            hr["cred_vulns"] = converted
+
         # CVE enrichment
         logger.info("[CVE ENRICH] Starting CVE enrichment stage")
         all_vulns = []
@@ -1958,7 +1964,7 @@ async def run_pipeline(scan_id: str, target: str) -> None:
         logger.info("[AI ANALYSIS] Generating scan-level audit analysis")
         try:
             from services.audit_analysis import generate_audit_analysis, persist_audit_analysis
-            analysis = await asyncio.wait_for(generate_audit_analysis(scan_id), timeout=90)
+            analysis = await asyncio.wait_for(generate_audit_analysis(scan_id), timeout=150)
             if analysis:
                 await persist_audit_analysis(scan_id, analysis)
                 mode = "AI" if analysis.get("ai_generated") else "fallback"

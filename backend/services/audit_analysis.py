@@ -558,6 +558,8 @@ TOP VULNERABILITIES (CVSS & URGENCY — top 5):
         _call(),
         fallback_value=fallback,
         context=f"audit_analysis:{scan_id}",
+        scan_id=scan_id,
+        timeout=120.0
     )
     return result
 

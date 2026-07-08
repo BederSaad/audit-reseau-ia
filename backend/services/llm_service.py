@@ -73,13 +73,13 @@ async def call_ollama(prompt: str, system: str = "", timeout: float = 30.0) -> s
         return data.get("response", "").strip()
 
 
-async def safe_llm_call(coro, fallback_value, context: str = "", host_ip: str = "unknown", scan_id: str = "unknown", input_summary: str = ""):
+async def safe_llm_call(coro, fallback_value, context: str = "", host_ip: str = "unknown", scan_id: str = "unknown", input_summary: str = "", timeout: float = 45.0):
     """Wraps any LLM enrichment call with timeout + error handling + fallback."""
     start_time = asyncio.get_event_loop().time()
     status = "success"
     output_summary = ""
     try:
-        result = await asyncio.wait_for(coro, timeout=45.0)
+        result = await asyncio.wait_for(coro, timeout=timeout)
         logger.info(f"[LLM DECISION] context='{context}' status=success")
         output_summary = str(result)[:200]
         return result
