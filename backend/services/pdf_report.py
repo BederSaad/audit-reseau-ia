@@ -1,4 +1,6 @@
 import io
+import os
+from typing import Optional
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -56,6 +58,96 @@ def get_timeframe_color(tf):
     if "semaine" in tf: return PDF_COLORS["high"]
     if "mois" in tf: return PDF_COLORS["medium"]
     return PDF_COLORS["low"]
+
+# ── Per-host methodology / attack-path helpers ────────────────────────────────
+def build_host_methodology_line(host: dict) -> str:
+    """One-sentence methodology statement adjusted to what was actually run
+    on this specific host."""
+    parts = ["découverte réseau (ARP/ICMP)"]
+    if host.get("services"):
+        parts.append("scan de ports Nmap (Pn, top-1000/-p-)")
+    web_ports = [s["port"] for s in host.get("services", []) if s.get("port") in
+                 {80, 443, 8080, 8443, 3000, 8000, 8888, 9090, 9443, 4443}]
+    if web_ports:
+        parts.append(f"tests de vulnérabilités Nuclei sur {len(web_ports)} port(s) web détecté(s)")
+    cred_tested = any(e.get("type") in ("auth_screenshot", "text") for e in host.get("evidence", []))
+    if cred_tested:
+        parts.append("tests d'identifiants par défaut sur les services exposés")
+    return f"Cet hôte a été analysé via {', '.join(parts)}."
+
+
+def build_port_status_table(host: dict, mono_style, meta_label_style, body_style, body_bold, colwidths=None):
+    """Pass/fail-style status table for open ports: state icon + port + service."""
+    rows = [[
+        Paragraph("<b>État</b>", meta_label_style),
+        Paragraph("<b>Port</b>", meta_label_style),
+        Paragraph("<b>Protocole</b>", meta_label_style),
+        Paragraph("<b>Service</b>", meta_label_style),
+        Paragraph("<b>Version</b>", meta_label_style),
+    ]]
+    for s in host.get("services", []):
+        is_open = (s.get("state", "open") == "open")
+        icon = "✅ Ouvert" if is_open else "⛔ Fermé"
+        icon_color = PDF_COLORS["safe"] if is_open else PDF_COLORS["text_muted"]
+        rows.append([
+            Paragraph(f"<font color='{icon_color.hexval()}'><b>{icon}</b></font>", body_style),
+            Paragraph(str(s["port"]), mono_style),
+            Paragraph(s.get("protocol", "tcp"), body_style),
+            Paragraph(s.get("name") or "Unknown", body_style),
+            Paragraph(s.get("version") or "Unknown", body_style),
+        ])
+    widths = colwidths or [1*inch, 0.8*inch, 1*inch, 2*inch, 2.7*inch]
+    t = Table(rows, colWidths=widths)
+    t.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), PDF_COLORS["bg_light"]),
+        ('PADDING', (0, 0), (-1, -1), 6),
+        ('LINEBELOW', (0, 0), (-1, 0), 1, colors.HexColor("#E2E8F0")),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, PDF_COLORS["bg_light"]]),
+    ]))
+    return t
+
+
+def build_host_attack_path(host: dict) -> Optional[str]:
+    """Host-specific 2-3 sentence attack-path narrative, built from what was
+    actually found on THIS host (not a network-wide generic scenario).
+    Rule-based fallback; if services/audit_analysis.py exposes a
+    per-host scenario in analysis['host_attack_paths'][ip] that should be
+    preferred by the caller before falling back to this function."""
+    vulns = host.get("vulnerabilities", [])
+    if not vulns:
+        return None
+
+    crit_high = [v for v in vulns if v.get("severity", "").lower() in ("critical", "high")]
+    cred_vulns = [v for v in vulns if v.get("source") == "credential_test"]
+    has_smb = any("smb" in (v.get("name", "") + str(host.get("services", []))).lower() for v in vulns) or \
+              any(s.get("port") in (139, 445) for s in host.get("services", []))
+    has_web = any(s.get("port") in {80, 443, 8080, 8443} for s in host.get("services", []))
+
+    if not crit_high and not cred_vulns:
+        return None
+
+    steps = []
+    if cred_vulns:
+        cred_names = ", ".join(sorted({c.get("name", "un service") for c in cred_vulns}))
+        steps.append(
+            f"Un attaquant disposant d'un accès réseau pourrait utiliser les identifiants par défaut "
+            f"validés sur {host['ip']} ({cred_names}) pour obtenir un accès direct au système."
+        )
+    elif crit_high:
+        worst = crit_high[0]
+        steps.append(
+            f"La vulnérabilité « {worst.get('name', 'identifiée')} » sur {host['ip']} pourrait être "
+            f"exploitée par un attaquant pour obtenir un accès non autorisé au système."
+        )
+    if has_smb:
+        steps.append("Cet accès pourrait ensuite servir à consulter ou exfiltrer les fichiers partagés via SMB.")
+    if has_web and len(steps) < 3:
+        steps.append("Un service web exposé sur cet hôte offre également une surface d'attaque supplémentaire pour la reconnaissance ou l'exploitation.")
+    if len(steps) < 2:
+        steps.append("Depuis cet hôte compromis, un attaquant pourrait pivoter vers d'autres machines du même réseau.")
+
+    return " ".join(steps[:3])
+
 
 # ── Matplotlib Chart Generators ────────────────────────────────────────────────
 def make_health_gauge(score):
@@ -604,6 +696,24 @@ async def generate_pdf_report(scan_id: str) -> bytes:
         parent=body_style,
         leftIndent=20,
         spaceAfter=4
+    )
+
+    methodology_style = ParagraphStyle(
+        'MethodologyStyle',
+        parent=body_style,
+        fontName='Helvetica-Oblique',
+        fontSize=9,
+        textColor=PDF_COLORS["text_muted"],
+        spaceAfter=10
+    )
+
+    caption_style = ParagraphStyle(
+        'EvidenceCaption',
+        parent=body_style,
+        fontName='Helvetica-Oblique',
+        fontSize=8.5,
+        textColor=PDF_COLORS["text_muted"],
+        spaceAfter=6
     )
     
     # ── Pre-calculate variables needed for executive summary ─────────────────────
@@ -1858,167 +1968,177 @@ async def generate_pdf_report(scan_id: str) -> bytes:
             ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
         ]))
         host_elements.append(host_info_table)
-        host_elements.append(Spacer(1, 12))
-        
-        # Services Table
+        host_elements.append(Spacer(1, 10))
+
+        # ── METHODOLOGY LINE ────────────────────────────────────────────────
+        host_elements.append(Paragraph(build_host_methodology_line(h), methodology_style))
+
+        # ── PORT STATUS TABLE (pass/fail style) ─────────────────────────────
         if h["services"]:
-            host_elements.append(Paragraph("<b>Services Détectés</b>", h3_style))
-            svc_data = [[
-                Paragraph("Port", meta_label_style),
-                Paragraph("État", meta_label_style),
-                Paragraph("Protocole", meta_label_style),
-                Paragraph("Service", meta_label_style),
-                Paragraph("Version", meta_label_style)
-            ]]
-            for s in h["services"]:
-                svc_data.append([
-                    Paragraph(str(s["port"]), mono_style),
-                    Paragraph(s.get("state", "open"), body_style),
-                    Paragraph(s["protocol"], body_style),
-                    Paragraph(s["name"] or "Unknown", body_style),
-                    Paragraph(s["version"] or "Unknown", body_style)
-                ])
-            
-            svc_table = Table(svc_data, colWidths=[0.8*inch, 1*inch, 1*inch, 2*inch, 2.7*inch])
-            svc_table.setStyle(TableStyle([
-                ('BACKGROUND', (0,0), (-1,0), PDF_COLORS["bg_light"]),
-                ('PADDING', (0,0), (-1,-1), 6),
-                ('LINEBELOW', (0,0), (-1,0), 1, colors.HexColor("#E2E8F0")),
-                ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, PDF_COLORS["bg_light"]])
-            ]))
-            host_elements.append(svc_table)
+            host_elements.append(Paragraph("<b>État des Ports</b>", h3_style))
+            host_elements.append(
+                build_port_status_table(h, mono_style, meta_label_style, body_style, body_bold)
+            )
             host_elements.append(Spacer(1, 12))
-            
-        # Vulnerabilities Table
-        if h["vulnerabilities"]:
-            host_elements.append(Paragraph("<b>Vulnérabilités Identifiées</b>", h3_style))
-            vuln_data = [[
-                Paragraph("Nom", meta_label_style),
-                Paragraph("Sévérité", meta_label_style),
-                Paragraph("CVE ID", meta_label_style),
-                Paragraph("CVSS", meta_label_style),
-                Paragraph("Source", meta_label_style)
-            ]]
-            for v in h["vulnerabilities"]:
-                sev_color = get_severity_color(v["severity"]).hexval()
-                cve_text = v.get("cve_id") or "—"
-                cvss_val = v.get("cvss_score")
-                cvss_str = f"{cvss_val:.1f}" if cvss_val is not None else "—"
-                source = v.get("source", "nuclei")
-                
-                vuln_data.append([
-                    Paragraph(v["name"][:50] + "..." if len(v["name"]) > 50 else v["name"], body_style),
-                    Paragraph(f"<b color='{sev_color}'>{v['severity'].upper()}</b>", body_style),
-                    Paragraph(cve_text[:20] + "..." if len(cve_text) > 20 else cve_text, mono_style),
-                    Paragraph(cvss_str, body_bold),
-                    Paragraph(source, body_style)
-                ])
-                
-            vuln_table = Table(vuln_data, colWidths=[2.5*inch, 1.2*inch, 1.5*inch, 0.8*inch, 1.5*inch])
-            vuln_table.setStyle(TableStyle([
-                ('BACKGROUND', (0,0), (-1,0), PDF_COLORS["bg_light"]),
-                ('PADDING', (0,0), (-1,-1), 6),
-                ('LINEBELOW', (0,0), (-1,0), 1, colors.HexColor("#E2E8F0")),
-                ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, PDF_COLORS["bg_light"]])
-            ]))
-            host_elements.append(vuln_table)
-        
-        # ── Evidence Blocks ───────────────────────────────────────────────────
+
+        # Index evidence by (port, kind) up front so findings can attach the
+        # right evidence item instead of dumping every screenshot at the end.
         evidence_items = h.get("evidence", [])
         web_screenshots = [e for e in evidence_items if e.get("type") == "web_screenshot"]
         auth_screenshots = [e for e in evidence_items if e.get("type") == "auth_screenshot"]
         text_evidences = [e for e in evidence_items if e.get("type") == "text"]
+        used_evidence_ids = set()
 
-        if evidence_items:
-            host_elements.append(Spacer(1, 10))
-            host_elements.append(Paragraph("<b>Preuves Capturées</b>", h3_style))
+        def _render_evidence_block(ev, icon, label_color, label_bg):
+            """Render one evidence item (screenshot or text) with its caption."""
+            blocks = []
+            ev_label = ev.get("label", "Preuve")
+            label_box = Table(
+                [[Paragraph(f"<b>{icon} {ev_label}</b>",
+                    ParagraphStyle('EvLabel', parent=body_style, textColor=label_color, fontSize=9))]],
+                colWidths=[7.5*inch]
+            )
+            label_box.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), label_bg),
+                ('PADDING', (0, 0), (-1, -1), 6),
+                ('LINELEFT', (0, 0), (-1, -1), 3, label_color),
+            ]))
+            blocks.append(label_box)
 
-        # Web Screenshots
-        for ev in web_screenshots:
-            ev_path = ev.get("path")
-            ev_label = ev.get("label", "Capture écran web")
-            if ev_path:
-                import os
-                if os.path.exists(ev_path):
+            if ev.get("type") in ("web_screenshot", "auth_screenshot"):
+                ev_path = ev.get("path")
+                if ev_path and os.path.exists(ev_path):
                     try:
                         img = Image(ev_path, width=6.5*inch, height=3.5*inch)
                         img.hAlign = 'LEFT'
-                        label_box = Table(
-                            [[Paragraph(f"<b>📷 {ev_label}</b>",
-                                ParagraphStyle('EvidenceLabel', parent=body_style,
-                                    textColor=PDF_COLORS['primary'], fontSize=9))]],
-                            colWidths=[7.5*inch]
-                        )
-                        label_box.setStyle(TableStyle([
-                            ('BACKGROUND', (0,0), (-1,-1), PDF_COLORS['bg_light']),
-                            ('PADDING', (0,0), (-1,-1), 6),
-                            ('LINELEFT', (0,0), (-1,-1), 3, PDF_COLORS['primary']),
-                        ]))
-                        host_elements.append(label_box)
-                        host_elements.append(img)
-                        host_elements.append(Spacer(1, 8))
+                        blocks.append(img)
                     except Exception:
                         pass
+            elif ev.get("type") == "text":
+                ev_content = ev.get("content", "")
+                if ev_content:
+                    terminal_box = Table(
+                        [[Paragraph(ev_content.replace('\n', '<br/>'),
+                            ParagraphStyle('TerminalStyle', parent=mono_style,
+                                backColor=colors.HexColor('#1E293B'),
+                                textColor=colors.HexColor('#86EFAC'),
+                                fontSize=8, leading=12))]],
+                        colWidths=[7.5*inch]
+                    )
+                    terminal_box.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, -1), colors.HexColor('#1E293B')),
+                        ('PADDING', (0, 0), (-1, -1), 10),
+                    ]))
+                    blocks.append(terminal_box)
 
-        # Auth Screenshots
-        for ev in auth_screenshots:
-            ev_path = ev.get("path")
-            ev_label = ev.get("label", "Preuve d'authentification")
-            if ev_path:
-                import os
-                if os.path.exists(ev_path):
-                    try:
-                        img = Image(ev_path, width=6.5*inch, height=3.5*inch)
-                        img.hAlign = 'LEFT'
-                        label_box = Table(
-                            [[Paragraph(f"<b>🔑 {ev_label}</b>",
-                                ParagraphStyle('AuthEvidenceLabel', parent=body_style,
-                                    textColor=PDF_COLORS['critical'], fontSize=9))]],
-                            colWidths=[7.5*inch]
-                        )
-                        label_box.setStyle(TableStyle([
-                            ('BACKGROUND', (0,0), (-1,-1), PDF_COLORS['bg_critical_tint']),
-                            ('PADDING', (0,0), (-1,-1), 6),
-                            ('LINELEFT', (0,0), (-1,-1), 3, PDF_COLORS['critical']),
-                        ]))
-                        host_elements.append(label_box)
-                        host_elements.append(img)
-                        host_elements.append(Spacer(1, 8))
-                    except Exception:
-                        pass
+            # Caption: exactly what this evidence shows
+            if ev.get("type") == "web_screenshot":
+                caption = f"Capture montrant l'état de la page web au moment du scan ({ev.get('label', '')})."
+            elif ev.get("type") == "auth_screenshot":
+                user = ev.get("username", "un identifiant par défaut")
+                caption = f"Capture prise après authentification réussie avec {user}, montrant l'accès obtenu."
+            else:
+                ts = ev.get("timestamp", "")
+                caption = f"Sortie de session réelle capturée le {ts} avec l'identifiant {ev.get('username', 'testé')}."
+            blocks.append(Paragraph(caption, caption_style))
+            blocks.append(Spacer(1, 6))
+            return blocks
 
-        # Text Evidence (SSH/FTP/SMB session output)
-        for ev in text_evidences:
-            ev_content = ev.get("content", "")
-            ev_label = ev.get("label", "Preuve de Connexion (texte)")
-            if ev_content:
-                label_box = Table(
-                    [[Paragraph(f"<b>🖥 {ev_label}</b>",
-                        ParagraphStyle('TextEvidenceLabel', parent=body_style,
-                            textColor=colors.HexColor('#92400E'), fontSize=9))]],
+        # ── FINDINGS: Evidence → Caption → Impact, INFO-level grouped ──────
+        vulns = h.get("vulnerabilities", [])
+        meaningful = [v for v in vulns if v.get("severity", "info").lower() != "info"]
+        info_only = [v for v in vulns if v.get("severity", "info").lower() == "info"]
+
+        if meaningful:
+            host_elements.append(Paragraph("<b>Constats</b>", h3_style))
+            for v in meaningful:
+                sev = v.get("severity", "info")
+                sev_color = get_severity_color(sev)
+                bg_tint = get_severity_bg_tint(sev)
+
+                finding_header = Table(
+                    [[Paragraph(f"<b>{v.get('name', 'Vulnérabilité')}</b> "
+                                f"<font color='{sev_color.hexval()}'>[{sev.upper()}]</font>"
+                                + (f"  CVE: {v.get('cve_id')}" if v.get('cve_id') else ""),
+                                body_bold)]],
                     colWidths=[7.5*inch]
                 )
-                label_box.setStyle(TableStyle([
-                    ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#FEF3C7')),
-                    ('PADDING', (0,0), (-1,-1), 6),
-                    ('LINELEFT', (0,0), (-1,-1), 3, colors.HexColor('#F59E0B')),
+                finding_header.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, -1), bg_tint),
+                    ('PADDING', (0, 0), (-1, -1), 8),
+                    ('LINELEFT', (0, 0), (-1, -1), 4, sev_color),
                 ]))
-                host_elements.append(label_box)
+                host_elements.append(finding_header)
 
-                terminal_box = Table(
-                    [[Paragraph(ev_content.replace('\n', '<br/>'),
-                        ParagraphStyle('TerminalStyle', parent=mono_style,
-                            backColor=colors.HexColor('#1E293B'),
-                            textColor=colors.HexColor('#86EFAC'),
-                            fontSize=8, leading=12))]],
-                    colWidths=[7.5*inch]
-                )
-                terminal_box.setStyle(TableStyle([
-                    ('BACKGROUND', (0,0), (-1,-1), colors.HexColor('#1E293B')),
-                    ('PADDING', (0,0), (-1,-1), 10),
-                ]))
-                host_elements.append(terminal_box)
-                host_elements.append(Spacer(1, 8))
+                # Attach matching evidence if this finding relates to a
+                # credential success (web auth screenshot or text evidence)
+                if v.get("source") == "credential_test":
+                    match = next((e for e in auth_screenshots + text_evidences
+                                  if id(e) not in used_evidence_ids), None)
+                    if match:
+                        used_evidence_ids.add(id(match))
+                        icon, color, bg = ("🔑", PDF_COLORS['critical'], PDF_COLORS['bg_critical_tint']) \
+                            if match.get("type") == "auth_screenshot" else \
+                            ("🖥", colors.HexColor('#92400E'), colors.HexColor('#FEF3C7'))
+                        host_elements.extend(_render_evidence_block(match, icon, color, bg))
+
+                # Impact statement in plain language
+                impact_text = v.get("description") or "Impact non documenté pour ce constat."
+                host_elements.append(Paragraph(f"<b>Impact :</b> {impact_text[:400]}", body_style))
+                host_elements.append(Spacer(1, 10))
+
+        if info_only:
+            host_elements.append(Paragraph(
+                f"<i>{len(info_only)} constat(s) de niveau INFO supplémentaire(s) regroupé(s) "
+                f"(détails informatifs sans impact de sécurité direct, disponibles en annexe).</i>",
+                caption_style
+            ))
+            host_elements.append(Spacer(1, 8))
+
+        # Any web screenshots not already attached to a specific finding
+        # (e.g. a clean web port with no vulnerability) still get shown once,
+        # so "multiple screenshots per host" always renders even without a
+        # matching finding.
+        leftover_web = [e for e in web_screenshots if id(e) not in used_evidence_ids]
+        if leftover_web:
+            host_elements.append(Paragraph("<b>Captures Web Complémentaires</b>", h3_style))
+            for ev in leftover_web:
+                host_elements.extend(_render_evidence_block(ev, "📷", PDF_COLORS['primary'], PDF_COLORS['bg_light']))
+
+        leftover_auth = [e for e in auth_screenshots + text_evidences if id(e) not in used_evidence_ids]
+        if leftover_auth:
+            host_elements.append(Paragraph("<b>Preuves d'Accès Complémentaires</b>", h3_style))
+            for ev in leftover_auth:
+                icon, color, bg = ("🔑", PDF_COLORS['critical'], PDF_COLORS['bg_critical_tint']) \
+                    if ev.get("type") == "auth_screenshot" else \
+                    ("🖥", colors.HexColor('#92400E'), colors.HexColor('#FEF3C7'))
+                host_elements.extend(_render_evidence_block(ev, icon, color, bg))
+
+        # No creds tested / none succeeded — explicit statement, never a
+        # silent empty section
+        cred_related = [v for v in vulns if v.get("source") == "credential_test"]
+        if h.get("services") and not cred_related and not auth_screenshots and not text_evidences:
+            host_elements.append(Paragraph(
+                "<i>Aucun identifiant par défaut n'a fonctionné sur cet hôte.</i>", caption_style
+            ))
+
+        # ── ATTACK PATH CALLOUT (host-specific) ─────────────────────────────
+        attack_path = None
+        host_attack_paths = (analysis or {}).get("host_attack_paths", {})
+        if isinstance(host_attack_paths, dict):
+            attack_path = host_attack_paths.get(h["ip"])
+        if not attack_path:
+            attack_path = build_host_attack_path(h)
+        if attack_path:
+            host_elements.append(Spacer(1, 6))
+            attack_box = Table([[Paragraph(f"<b>⚔ Chemin d'Attaque Possible :</b> {attack_path}", body_style)]],
+                                colWidths=[7.5*inch])
+            attack_box.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, -1), PDF_COLORS["bg_critical_tint"]),
+                ('PADDING', (0, 0), (-1, -1), 12),
+                ('LINELEFT', (0, 0), (-1, -1), 5, PDF_COLORS["critical"]),
+            ]))
+            host_elements.append(attack_box)
 
         story.append(KeepTogether(host_elements))
         story.append(Spacer(1, 25))

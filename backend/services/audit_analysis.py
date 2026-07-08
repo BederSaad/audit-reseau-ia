@@ -511,26 +511,35 @@ def build_fallback_analysis(context: dict) -> dict:
 # ── Main Generator ────────────────────────────────────────────────────────────
 async def generate_audit_analysis(scan_id: str) -> dict:
     """Builds context → calls LLM (with fallback) → returns analysis dict."""
-    from services.llm_service import call_ollama, safe_llm_call
+    from services.llm_service import call_ollama, safe_llm_call, check_ollama_available
 
     context = await build_scan_context(scan_id)
     if not context:
         return {}
 
-    context_text = f"""
-AUDIT TARGET: {context['target']}
+    # ── Pre-flight: skip LLM if Ollama is not reachable ──────────────────────
+    ollama_ok = await check_ollama_available()
+    if not ollama_ok:
+        logger.warning(
+            "[AuditAnalysis] Ollama not available or model not loaded — "
+            "using deterministic fallback analysis."
+        )
+        return build_fallback_analysis(context)
+
+    # ── Build a compact context (top 5 vulns max) to avoid OOM 500s ──────────
+    context_text = f"""AUDIT TARGET: {context['target']}
 DURATION: {context['duration_seconds']:.0f} seconds
 
 ATTACK SURFACE SUMMARY:
 {context['hosts_found']} devices discovered.
-{chr(10).join(f"- {h['ip']} ({h['os']}): {h['total_vulns']} vulnerabilities detected." for h in context['hosts_summary'])}
+{chr(10).join(f"- {h['ip']} ({h['os']}): {h['total_vulns']} vulnerabilities ({h['critical_count']} critical, {h['high_count']} high)." for h in context['hosts_summary'])}
 
 CREDENTIAL COMPROMISE VALIDATION:
 {len(context['working_credentials'])} direct access confirmed.
-{chr(10).join(f"- {c.get('host_ip')}: Successful login on {c.get('service')} with '{c.get('matcher_name')}'" for c in context['working_credentials']) or "No functioning default credentials detected."}
+{chr(10).join(f"- {c.get('host_ip')}: Login on {c.get('service')} with '{c.get('matcher_name')}'" for c in context['working_credentials']) or "No default credentials found."}
 
-TOP TECHNICAL VULNERABILITIES (CVSS & URGENCY):
-{chr(10).join(f"- {v.get('name')} on {v.get('host_ip')} | CVSS: {v.get('cvss_score')} | Urgency: {v.get('urgency_score')}/100" for v in context['top_10_priorities'])}
+TOP VULNERABILITIES (CVSS & URGENCY — top 5):
+{chr(10).join(f"- {v.get('name')} on {v.get('host_ip')} | CVSS: {v.get('cvss_score')} | Urgency: {v.get('urgency_score')}/100" for v in context['top_10_priorities'][:5])}
 """
 
     async def _call():

@@ -5,15 +5,43 @@ import logging
 import asyncio
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:14b")   # <-- changed here
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
 logger = logging.getLogger("LLMService")
+
+# Maximum number of characters to send in a single prompt.
+# Large prompts cause OOM crashes on the model, which Ollama surfaces as a 500.
+MAX_PROMPT_CHARS = 6000
+
+
+async def check_ollama_available() -> bool:
+    """Quick health-check: is Ollama running and is the model available?"""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{OLLAMA_HOST}/api/tags")
+            if resp.status_code != 200:
+                return False
+            models = [m.get("name", "") for m in resp.json().get("models", [])]
+            model_base = OLLAMA_MODEL.split(":")[0].lower()
+            return any(model_base in m.lower() for m in models)
+    except Exception:
+        return False
+
 
 async def call_ollama(prompt: str, system: str = "", timeout: float = 30.0) -> str:
     """
     Calls local Ollama instance. Returns raw text response.
     Raises httpx.TimeoutException or httpx.ConnectError on failure — caller must handle.
+    Automatically truncates prompts that are too long to avoid Ollama OOM 500 errors.
     """
+    # Truncate to avoid OOM-induced 500 errors
+    if len(prompt) > MAX_PROMPT_CHARS:
+        logger.warning(
+            f"[LLM] Prompt truncated from {len(prompt)} to {MAX_PROMPT_CHARS} chars "
+            "to prevent Ollama OOM (500) error."
+        )
+        prompt = prompt[:MAX_PROMPT_CHARS] + "\n\n[...truncated for context length]"
+
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
@@ -22,10 +50,28 @@ async def call_ollama(prompt: str, system: str = "", timeout: float = 30.0) -> s
         "options": {"temperature": 0.2}
     }
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(f"{OLLAMA_HOST}/api/generate", json=payload)
-        resp.raise_for_status()
+        try:
+            resp = await client.post(f"{OLLAMA_HOST}/api/generate", json=payload)
+            if resp.status_code == 500:
+                body = ""
+                try:
+                    body = resp.json().get("error", resp.text[:200])
+                except Exception:
+                    body = resp.text[:200]
+                raise RuntimeError(
+                    f"Ollama 500 on model '{OLLAMA_MODEL}': {body}. "
+                    "Possible causes: model not loaded, out of VRAM/RAM, or context overflow. "
+                    f"Try: ollama run {OLLAMA_MODEL}"
+                )
+            resp.raise_for_status()
+        except httpx.ConnectError:
+            raise RuntimeError(
+                f"Cannot connect to Ollama at {OLLAMA_HOST}. "
+                "Make sure Ollama is running: ollama serve"
+            )
         data = resp.json()
         return data.get("response", "").strip()
+
 
 async def safe_llm_call(coro, fallback_value, context: str = "", host_ip: str = "unknown", scan_id: str = "unknown", input_summary: str = ""):
     """Wraps any LLM enrichment call with timeout + error handling + fallback."""

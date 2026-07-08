@@ -285,6 +285,141 @@ def _extract_hostscript_outputs(host_el) -> dict[str, str]:
     return outputs
 
 
+# ── Known NSE script → severity mapping ───────────────────────────────────────
+# These are well-known, exploitable vulnerabilities whose NSE output may not
+# contain explicit CVSS scores or severity keywords, but are definitively severe.
+KNOWN_NSE_SCRIPT_SEVERITIES: dict[str, tuple[str, float | None, str | None]] = {
+    # (severity, cvss_score, cve_id)
+    "smb-vuln-ms17-010":        ("critical", 9.3,  "CVE-2017-0144"),   # EternalBlue
+    "smb-vuln-ms08-067":        ("critical", 10.0, "CVE-2008-4250"),
+    "smb-vuln-cve2009-3103":    ("critical", 7.8,  "CVE-2009-3103"),
+    "smb-vuln-ms10-054":        ("medium",   4.9,  "CVE-2010-2550"),
+    "smb-vuln-ms10-061":        ("high",     6.9,  "CVE-2010-2729"),
+    "smb-vuln-regsvc-dos":      ("medium",   4.0,  None),
+    "ftp-vsftpd-backdoor":       ("critical", 10.0, "CVE-2011-2523"),
+    "ftp-proftpd-backdoor":      ("critical", 9.0,  "CVE-2010-4221"),
+    "irc-unrealircd-backdoor":   ("critical", 10.0, "CVE-2010-2075"),
+    "rmi-vuln-classloader":      ("high",     7.5,  None),
+    "http-shellshock":           ("critical", 10.0, "CVE-2014-6271"),
+    "ssl-heartbleed":            ("critical", 9.8,  "CVE-2014-0160"),
+    "ssl-poodle":                ("medium",   4.3,  "CVE-2014-3566"),
+    "http-csrf":                 ("medium",   6.8,  None),
+    "http-dombased-xss":         ("medium",   4.3,  None),
+    "http-stored-xss":           ("high",     7.5,  None),
+    "http-sql-injection":        ("high",     7.5,  None),
+    "vulners":                   ("medium",   5.0,  None),
+}
+
+# ── Known-dangerous service signatures → auto-generated vulnerabilities ────────
+# These catch specific banners/versions/ports that are definitively backdoored
+# or critically exposed, regardless of what Nmap NSE scripts say.
+DANGEROUS_SERVICE_SIGNATURES: list[dict] = [
+    {
+        "match_port": 1524,
+        "match_banner_contains": None,   # any service on port 1524 = bindshell
+        "name": "Metasploitable Root Bindshell (port 1524)",
+        "severity": "critical",
+        "cvss_score": 10.0,
+        "cve_id": None,
+        "description": "Port 1524 is reserved for a Metasploitable-installed root backdoor shell. Any unauthenticated attacker can obtain root access by connecting to this port.",
+        "template_id": "dangerous-service-bindshell-1524",
+    },
+    {
+        "match_port": 21,
+        "match_banner_contains": "vsftpd 2.3.4",
+        "name": "vsftpd 2.3.4 Backdoor Command Execution",
+        "severity": "critical",
+        "cvss_score": 10.0,
+        "cve_id": "CVE-2011-2523",
+        "description": "vsftpd 2.3.4 contains a deliberately-inserted backdoor. A smiley face ':)' in the username triggers a root shell on port 6200.",
+        "template_id": "dangerous-service-vsftpd-2.3.4-backdoor",
+    },
+    {
+        "match_port": None,
+        "match_banner_contains": "UnrealIRCd",
+        "name": "UnrealIRCd Backdoor Command Execution",
+        "severity": "critical",
+        "cvss_score": 10.0,
+        "cve_id": "CVE-2010-2075",
+        "description": "Certain builds of UnrealIRCd 3.2.8.1 contain a backdoor that executes arbitrary commands as root.",
+        "template_id": "dangerous-service-unrealircd-backdoor",
+    },
+    {
+        "match_port": 2121,
+        "match_banner_contains": "ProFTPD 1.3.1",
+        "name": "ProFTPD 1.3.1 SQL Injection (CVE-2009-0543)",
+        "severity": "high",
+        "cvss_score": 7.5,
+        "cve_id": "CVE-2009-0543",
+        "description": "ProFTPD 1.3.1 is vulnerable to SQL injection in the mod_sql module.",
+        "template_id": "dangerous-service-proftpd-1.3.1",
+    },
+    {
+        "match_port": None,
+        "match_banner_contains": "Samba 3.0",
+        "name": "Samba 3.0.x - 'username map script' RCE (CVE-2007-2447)",
+        "severity": "critical",
+        "cvss_score": 9.3,
+        "cve_id": "CVE-2007-2447",
+        "description": "Samba 3.0.20 through 3.0.25rc3 allows remote attackers to execute arbitrary commands via shell metacharacters.",
+        "template_id": "dangerous-service-samba-username-map-script",
+    },
+    {
+        "match_port": 23,
+        "match_banner_contains": None,
+        "name": "Telnet Service Exposed (Cleartext Protocol)",
+        "severity": "high",
+        "cvss_score": 7.5,
+        "cve_id": None,
+        "description": "Telnet transmits credentials and data in cleartext. Any attacker on the network can intercept usernames, passwords, and session data.",
+        "template_id": "dangerous-service-telnet-cleartext",
+    },
+]
+
+
+def detect_dangerous_services(services: list[dict]) -> list[dict]:
+    """Scan a host's service list for known-dangerous banners/versions/ports.
+    Returns a list of vulnerability dicts to inject into nse_vulns."""
+    findings: list[dict] = []
+    seen_templates: set[str] = set()
+
+    for svc in services:
+        port = svc.get("port")
+        version = (svc.get("version") or "").lower()
+        banner = (svc.get("banner") or "").lower()
+        combined_text = f"{version} {banner}"
+
+        for sig in DANGEROUS_SERVICE_SIGNATURES:
+            tid = sig["template_id"]
+            if tid in seen_templates:
+                continue
+
+            port_match = (sig["match_port"] is None) or (sig["match_port"] == port)
+            banner_match = (
+                sig["match_banner_contains"] is None
+                or sig["match_banner_contains"].lower() in combined_text
+            )
+
+            if port_match and banner_match:
+                seen_templates.add(tid)
+                findings.append({
+                    "template_id": tid,
+                    "name": sig["name"],
+                    "severity": sig["severity"],
+                    "cve_id": sig["cve_id"],
+                    "cvss_score": sig["cvss_score"],
+                    "cvss_estimated": False,
+                    "matcher_name": tid,
+                    "description": sig["description"],
+                    "source": "signature_detection",
+                    "remediation": "Upgrade or remove this service immediately.",
+                    "exploit_available": True,
+                    "references": [f"https://nvd.nist.gov/vuln/detail/{sig['cve_id']}"] if sig["cve_id"] else [],
+                })
+
+    return findings
+
+
 def _parse_vulnerabilities_from_nmap_xml(host_el, host_ip: str) -> list[dict]:
     vulns = []
     for script_el in host_el.findall("hostscript/script"):
@@ -306,25 +441,54 @@ def _parse_vulnerabilities_from_nmap_xml(host_el, host_ip: str) -> list[dict]:
 
 
 def _extract_vuln_from_script_output(script_id: str, output: str, host_ip: str) -> dict | None:
-    cvss_match = re.search(r'CVSS\s+(\d+\.?\d*)', output, re.I)
-    cvss_score = float(cvss_match.group(1)) if cvss_match else None
-
-    severity = "info"
-    if cvss_score is not None:
-        if cvss_score >= 9.0: severity = "critical"
-        elif cvss_score >= 7.0: severity = "high"
-        elif cvss_score >= 4.0: severity = "medium"
-        elif cvss_score > 0: severity = "low"
+    # ── Step 1: Check known script severity mapping first ──────────────────────
+    known = KNOWN_NSE_SCRIPT_SEVERITIES.get(script_id.lower())
+    if known:
+        known_sev, known_cvss, known_cve = known
+        # Only use if output doesn't explicitly say "NOT VULNERABLE"
+        if "NOT VULNERABLE" in output and "VULNERABLE" not in output.replace("NOT VULNERABLE", ""):
+            return None  # explicitly not vulnerable
+        severity = known_sev
+        cvss_score = known_cvss
+        cve_id = known_cve
+        # Still try to extract CVE from output if not in mapping
+        if not cve_id:
+            cve_match = re.search(r'(CVE-\d{4}-\d{4,})', output, re.I)
+            cve_id = cve_match.group(1) if cve_match else None
+        # Also try CVSS from output
+        cvss_match = re.search(r'CVSS\s+([\d\.]+)', output, re.I)
+        if cvss_match:
+            cvss_score = float(cvss_match.group(1))
     else:
-        if "critical" in output.lower(): severity = "critical"
-        elif "high" in output.lower(): severity = "high"
-        elif "medium" in output.lower(): severity = "medium"
-        elif "low" in output.lower(): severity = "low"
+        # ── Step 2: Generic extraction ─────────────────────────────────────────
+        cvss_match = re.search(r'CVSS\s+([\d\.]+)', output, re.I)
+        cvss_score = float(cvss_match.group(1)) if cvss_match else None
 
-    cve_match = re.search(r'(CVE-\d{4}-\d{4,})', output, re.I)
-    cve_id = cve_match.group(1) if cve_match else None
+        severity = "info"
+        if cvss_score is not None:
+            if cvss_score >= 9.0:  severity = "critical"
+            elif cvss_score >= 7.0: severity = "high"
+            elif cvss_score >= 4.0: severity = "medium"
+            elif cvss_score > 0:   severity = "low"
+        else:
+            if "critical" in output.lower():  severity = "critical"
+            elif "high" in output.lower():    severity = "high"
+            elif "medium" in output.lower():  severity = "medium"
+            elif "low" in output.lower():     severity = "low"
+            # Key fix: if output explicitly says VULNERABLE but no severity keyword found,
+            # default to medium (not info) — it IS a finding.
+            elif "VULNERABLE" in output and "NOT VULNERABLE" not in output:
+                severity = "medium"
+                cvss_score = 5.0  # conservative CVSS estimate
 
-    name = script_id.replace("_", " ").title()
+        cve_match = re.search(r'(CVE-\d{4}-\d{4,})', output, re.I)
+        cve_id = cve_match.group(1) if cve_match else None
+
+    # ── Step 3: Skip if not actually vulnerable ────────────────────────────────
+    if "NOT VULNERABLE" in output and "VULNERABLE" not in output.replace("NOT VULNERABLE", ""):
+        return None
+
+    name = script_id.replace("-", " ").replace("_", " ").title()
     title_match = re.search(r'VULNERABLE:\s*([^\n]+)', output, re.I)
     if title_match:
         name = title_match.group(1).strip()
@@ -344,8 +508,8 @@ def _extract_vuln_from_script_output(script_id: str, output: str, host_ip: str) 
         "description": desc,
         "source": "nmap_nse",
         "remediation": "",
-        "exploit_available": False,
-        "references": [],
+        "exploit_available": known is not None,  # known scripts are more likely exploitable
+        "references": ([f"https://nvd.nist.gov/vuln/detail/{cve_id}"] if cve_id else []),
     }
 
 
@@ -1029,7 +1193,11 @@ def extract_cve_from_template_id(template_id: str) -> str | None:
 
 
 def compute_health_score(all_vulns: list[dict]) -> int:
-    weights = {"critical": 10, "high": 6, "medium": 3, "low": 1, "info": 0}
+    """Compute a 0-100 health score from discovered vulnerabilities.
+    Weights are calibrated so that a single critical vuln drops the score
+    significantly (e.g. 1 critical → ~75, 3 criticals → ~25).
+    """
+    weights = {"critical": 25, "high": 10, "medium": 4, "low": 1, "info": 0}
     risk = sum(weights.get((v.get("severity") or "info").lower(), 0) for v in all_vulns)
     return max(0, 100 - risk)
 
@@ -1307,7 +1475,14 @@ async def service_scan_host(ip: str, arp_snapshot: dict[str, str] | None = None,
             if result is not None:
                 result = await _enrich_host_result(result, ip, arp_snapshot, mdns_names, gateway_ip, local_ips)
                 result["discovery_method"] = "deep-scan-extreme"
-                result["nse_vulns"] = result.get("nse_vulns", [])
+                # Inject dangerous-service signature findings into nse_vulns
+                sig_vulns = detect_dangerous_services(result.get("services", []))
+                result["nse_vulns"] = result.get("nse_vulns", []) + sig_vulns
+                if sig_vulns:
+                    logger.warning(
+                        f"[SERVICE SCAN] {ip} — {len(sig_vulns)} dangerous service signature(s) detected: "
+                        + ", ".join(v['name'] for v in sig_vulns)
+                    )
 
                 duration = asyncio.get_event_loop().time() - t0
                 logger.info(
@@ -1342,13 +1517,18 @@ async def service_scan_host(ip: str, arp_snapshot: dict[str, str] | None = None,
 
 WEB_PORTS = {80, 443, 8080, 8443, 3000, 8000, 8888, 9090, 9443, 4443}
 HTTPS_PORTS = {443, 8443, 9443, 4443}
+# Non-web service ports that nuclei can still test with network-level CVE templates
+NETWORK_NUCLEI_PORTS = {21, 22, 23, 25, 53, 110, 143, 3306, 5432, 6379, 5900, 2049, 1099, 2121}
 
 async def nuclei_scan_host(ip: str, open_ports: list[int]) -> list[dict]:
     web_ports = [p for p in open_ports if p in WEB_PORTS]
-    if not web_ports:
+    # Also scan known non-web ports for CVE-tagged network templates
+    network_ports = [p for p in open_ports if p in NETWORK_NUCLEI_PORTS and p not in WEB_PORTS]
+
+    if not web_ports and not network_ports:
         return []
 
-    async def _scan_single_port(port: int, attempt: int = 1, max_attempts: int = 2) -> list[dict]:
+    async def _scan_web_port(port: int, attempt: int = 1, max_attempts: int = 2) -> list[dict]:
         scheme = "https" if port in HTTPS_PORTS else "http"
         url = f"{scheme}://{ip}:{port}"
         tmp = Path(tempfile.mktemp(suffix=f"_nuclei_{ip.replace('.','_')}_{port}.json"))
@@ -1372,7 +1552,7 @@ async def nuclei_scan_host(ip: str, open_ports: list[int]) -> list[dict]:
                     capture_output=True, check=False, timeout=180,
                 )
             vulns = _parse_nuclei_jsonl(tmp)
-            logger.info(f"[NUCLEI] {ip}:{port} — {len(vulns)} vulnerabilities found")
+            logger.info(f"[NUCLEI] {ip}:{port} (web) — {len(vulns)} vulnerabilities found")
             return vulns
         except subprocess.TimeoutExpired:
             logger.error(f"[NUCLEI] Timed out on {ip}:{port} — not retrying")
@@ -1380,15 +1560,51 @@ async def nuclei_scan_host(ip: str, open_ports: list[int]) -> list[dict]:
         except Exception as exc:
             logger.error(f"[NUCLEI] Error on {ip}:{port}: {exc}")
             if attempt < max_attempts:
-                return await _scan_single_port(port, attempt + 1, max_attempts)
+                return await _scan_web_port(port, attempt + 1, max_attempts)
             return []
         finally:
             tmp.unlink(missing_ok=True)
 
-    results = await asyncio.gather(*[_scan_single_port(p) for p in web_ports])
+    async def _scan_network_port(port: int) -> list[dict]:
+        """Run nuclei CVE templates against non-web services (FTP, SSH, MySQL, etc.)."""
+        target_url = f"{ip}:{port}"
+        tmp = Path(tempfile.mktemp(suffix=f"_nuclei_net_{ip.replace('.','_')}_{port}.json"))
+        try:
+            cmd = [
+                NUCLEI_PATH,
+                "-u", target_url,
+                "-tags", "cve,default-login,network",
+                "-severity", "critical,high,medium,low",
+                "-jsonl",
+                "-o", str(tmp),
+                "-silent",
+                "-ni",
+                "-duc",
+                "-timeout", "8",
+                "-retries", "0",
+            ]
+            async with _sem:
+                await asyncio.to_thread(
+                    subprocess.run, cmd,
+                    capture_output=True, check=False, timeout=120,
+                )
+            vulns = _parse_nuclei_jsonl(tmp)
+            if vulns:
+                logger.info(f"[NUCLEI] {ip}:{port} (network) — {len(vulns)} CVE findings")
+            return vulns
+        except Exception as exc:
+            logger.debug(f"[NUCLEI] Network scan skipped for {ip}:{port}: {exc}")
+            return []
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    web_tasks = [_scan_web_port(p) for p in web_ports]
+    net_tasks = [_scan_network_port(p) for p in network_ports]
+    results = await asyncio.gather(*(web_tasks + net_tasks), return_exceptions=True)
     all_vulns: list[dict] = []
     for r in results:
-        all_vulns.extend(r)
+        if isinstance(r, list):
+            all_vulns.extend(r)
     return all_vulns
 
 
