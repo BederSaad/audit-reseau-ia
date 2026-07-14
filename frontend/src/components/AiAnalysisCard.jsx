@@ -15,7 +15,7 @@ const AiAnalysisCard = ({ scanId }) => {
 
     let mounted = true;
     let retryCount = 0;
-    const maxRetries = 15; // Try for up to 30 seconds (15 * 2s)
+    const maxRetries = 180; // Try for up to 360 seconds (180 * 2s)
 
     const fetchAnalysis = async () => {
       if (!mounted) return;

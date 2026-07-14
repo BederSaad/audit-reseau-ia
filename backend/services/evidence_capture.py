@@ -9,16 +9,12 @@ from typing import List, Dict, Optional
 
 logger = logging.getLogger("EvidenceCapture")
 
-# Ensure Playwright is installed:
-# pip install playwright && playwright install
 try:
     from playwright.async_api import async_playwright
 except ImportError:
     logger.warning("Playwright not installed. Web screenshots will be skipped.")
     async_playwright = None
 
-# Optional: real SSH/FTP evidence capture.
-# pip install paramiko  (SSH banner + real auth confirmation)
 try:
     import paramiko
 except ImportError:
@@ -48,8 +44,7 @@ def _evidence_dir(scan_id: str) -> Path:
 
 
 # =============================================================================
-# WEB SCREENSHOT (existing feature — kept, filename now includes port so
-# multiple web ports on the same host no longer overwrite each other)
+# WEB SCREENSHOT
 # =============================================================================
 async def _capture_web_screenshot_impl(scan_id: str, ip: str, port: int, url: str) -> Optional[Path]:
     if not async_playwright:
@@ -85,9 +80,7 @@ async def capture_host_screenshot(scan_id: str, ip: str, port: int, url: str) ->
 
 
 # =============================================================================
-# CREDENTIAL SUCCESS SCREENSHOT (web-based only) — filename now includes port
-# and username so multiple successful web logins on the same host (different
-# ports, or different accounts on the same port) don't collide.
+# CREDENTIAL SUCCESS SCREENSHOT (web-based only)
 # =============================================================================
 async def _capture_auth_screenshot_impl(
     scan_id: str, ip: str, port: int, url: str, username: str, password: str
@@ -134,25 +127,15 @@ async def _capture_auth_screenshot_impl(
 async def capture_auth_screenshot(
     scan_id: str, ip: str, port: int, url: str, username: str, password: str
 ) -> Optional[Path]:
-    """Attempt to log in and capture a screenshot after successful authentication.
-    Saved as {host_ip}_{port}_{username}_auth.png."""
+    """Attempt to log in and capture a screenshot after successful authentication."""
     return await asyncio.to_thread(
         _run_sync_in_new_loop, _capture_auth_screenshot_impl, scan_id, ip, port, url, username, password
     )
 
 
 # =============================================================================
-# CREDENTIAL SUCCESS EVIDENCE — non-web protocols (SSH/FTP real capture;
-# RDP/DB captured with best-effort connection confirmation).
-#
-# IMPORTANT: this replaces the old stub that always printed a canned line
-# regardless of whether a real session was opened. Each function below
-# actually connects using the validated credentials and records what the
-# service really said back. If the real connection attempt fails (network
-# blip, service closed the port between test and capture, etc.) we say so
-# explicitly rather than fabricating session output.
+# REAL SSH EVIDENCE — uses paramiko to open an actual session
 # =============================================================================
-
 def _capture_ssh_text_evidence(ip: str, port: int, username: str, password: str) -> str:
     """Open a real SSH session with the validated credentials and capture the
     banner + auth confirmation. Requires paramiko."""
@@ -185,6 +168,9 @@ def _capture_ssh_text_evidence(ip: str, port: int, username: str, password: str)
     return "\n".join(lines)
 
 
+# =============================================================================
+# REAL FTP EVIDENCE — uses ftplib to open an actual session
+# =============================================================================
 def _capture_ftp_text_evidence(ip: str, port: int, username: str, password: str) -> str:
     """Open a real FTP session with the validated credentials and capture the
     login response verbatim."""
@@ -209,13 +195,12 @@ def _capture_ftp_text_evidence(ip: str, port: int, username: str, password: str)
     return "\n".join(lines)
 
 
+# =============================================================================
+# GENERIC TEXT EVIDENCE — for RDP/DB/other protocols
+# =============================================================================
 def _capture_generic_text_evidence(ip: str, port: int, service: str, credentials: List[Dict]) -> str:
-    """Fallback for RDP/DB/other protocols we don't have a native capture for
-    yet. We are explicit that this is a TCP-reachability confirmation, NOT a
-    full authenticated-session transcript, so the report never overstates
-    what was actually captured.
-    TODO: add native capture (e.g. via `xfreerdp` headless for RDP, or the
-    relevant DB driver's connection handshake) when those deps are approved."""
+    """Fallback for protocols without a native capture path.
+    Explicitly states this is TCP reachability confirmation, not a full session transcript."""
     lines = [f"Preuve de connexion - {service.upper()} sur {ip}:{port}"]
     lines.append("Identifiants testés et validés par le module de test (voir résultats credential_testing) :")
     for cred in credentials:
@@ -234,6 +219,9 @@ def _capture_generic_text_evidence(ip: str, port: int, service: str, credentials
     return "\n".join(lines)
 
 
+# =============================================================================
+# MAIN ENTRY POINT — credential text evidence dispatcher
+# =============================================================================
 def capture_credential_text(scan_id: str, ip: str, port: int, service: str, credentials: List[Dict]) -> Dict:
     """Build a real, protocol-appropriate text evidence block for non-web
     credential successes. Uses the first validated credential pair to open
@@ -262,4 +250,61 @@ def capture_credential_text(scan_id: str, ip: str, port: int, service: str, cred
         "port": port,
         "service": service,
         "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+# =============================================================================
+# COMMAND EVIDENCE BUILDER — called from main.py after nmap/nuclei runs
+# =============================================================================
+def build_command_evidence(
+    tool: str,
+    cmd: list,
+    stdout: str,
+    stderr: str = "",
+    ip: str = "",
+    port: int = 0,
+    label: str = "",
+) -> Dict:
+    """
+    Build a structured 'command' evidence entry from a real subprocess run.
+
+    This is called by main.py immediately after nmap or nuclei subprocess.run()
+    returns, storing the ACTUAL command executed and its ACTUAL stdout.
+    Nothing is fabricated — if stdout is empty we say so explicitly.
+
+    Args:
+        tool:   "nmap" | "nuclei"
+        cmd:    The exact list passed to subprocess.run (e.g. [NMAP_PATH, "-Pn", ...])
+        stdout: proc.stdout decoded — the real terminal output
+        stderr: proc.stderr decoded — included if non-empty for debugging
+        ip:     Target IP
+        port:   Target port (0 for nmap host scans)
+        label:  Human-readable label for the PDF evidence block
+    """
+    cmd_str = " ".join(str(c) for c in cmd)
+
+    # Trim stdout to a reasonable length for the PDF but keep it complete enough to be useful
+    stdout_trimmed = stdout.strip()
+    if len(stdout_trimmed) > 4000:
+        stdout_trimmed = stdout_trimmed[:4000] + "\n... [sortie tronquée à 4000 caractères]"
+
+    if not stdout_trimmed:
+        stdout_trimmed = "(aucune sortie stdout — les résultats ont été écrits dans le fichier XML/JSONL)"
+
+    output_lines = [f"$ {cmd_str}", "", stdout_trimmed]
+
+    if stderr and stderr.strip() and tool == "nmap":
+        stderr_tail = stderr.strip()[-500:]
+        output_lines += ["", f"[stderr] {stderr_tail}"]
+
+    return {
+        "type": "command",
+        "tool": tool,
+        "cmd": cmd_str,
+        "output": "\n".join(output_lines),
+        "label": label or f"Commande {tool.upper()} exécutée sur {ip}" + (f":{port}" if port else ""),
+        "ip": ip,
+        "port": port,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "real": True,  # explicit flag: this is NOT fabricated
     }

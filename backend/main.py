@@ -45,12 +45,13 @@ from services.credential_testing import run_credential_tests, credential_results
 from services.cve_enrichment import enrich_vulnerabilities_list
 from services.risk_scoring import calculate_host_risk_score, criticality_from_score
 
-# ── 5. NEW: Evidence capture ─────────────────────────────────────────────────
+# ── 5. Evidence capture ─────────────────────────────────────────────────────
 from services.evidence_capture import (
     capture_web_screenshot,
     capture_host_screenshot,
     capture_auth_screenshot,
     capture_credential_text,
+    build_command_evidence,          # NEW — real command evidence builder
 )
 
 # =============================================================================
@@ -86,6 +87,7 @@ try:
     NUCLEI_PATH = resolve_tool("nuclei", [
         str(Path.home() / "go/bin/nuclei.exe"),
         "C:/tools/nuclei/nuclei.exe",
+        "nuclei.exe",  # Try PATH
     ])
 except RuntimeError as exc:
     logger.critical(str(exc))
@@ -104,7 +106,7 @@ AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_co
 Base = declarative_base()
 
 # =============================================================================
-# ORM MODELS (inlined for clarity)
+# ORM MODELS
 # =============================================================================
 class Scan(Base):
     __tablename__ = "scans"
@@ -285,12 +287,8 @@ def _extract_hostscript_outputs(host_el) -> dict[str, str]:
     return outputs
 
 
-# ── Known NSE script → severity mapping ───────────────────────────────────────
-# These are well-known, exploitable vulnerabilities whose NSE output may not
-# contain explicit CVSS scores or severity keywords, but are definitively severe.
 KNOWN_NSE_SCRIPT_SEVERITIES: dict[str, tuple[str, float | None, str | None]] = {
-    # (severity, cvss_score, cve_id)
-    "smb-vuln-ms17-010":        ("critical", 9.3,  "CVE-2017-0144"),   # EternalBlue
+    "smb-vuln-ms17-010":        ("critical", 9.3,  "CVE-2017-0144"),
     "smb-vuln-ms08-067":        ("critical", 10.0, "CVE-2008-4250"),
     "smb-vuln-cve2009-3103":    ("critical", 7.8,  "CVE-2009-3103"),
     "smb-vuln-ms10-054":        ("medium",   4.9,  "CVE-2010-2550"),
@@ -310,13 +308,10 @@ KNOWN_NSE_SCRIPT_SEVERITIES: dict[str, tuple[str, float | None, str | None]] = {
     "vulners":                   ("medium",   5.0,  None),
 }
 
-# ── Known-dangerous service signatures → auto-generated vulnerabilities ────────
-# These catch specific banners/versions/ports that are definitively backdoored
-# or critically exposed, regardless of what Nmap NSE scripts say.
 DANGEROUS_SERVICE_SIGNATURES: list[dict] = [
     {
         "match_port": 1524,
-        "match_banner_contains": None,   # any service on port 1524 = bindshell
+        "match_banner_contains": None,
         "name": "Metasploitable Root Bindshell (port 1524)",
         "severity": "critical",
         "cvss_score": 10.0,
@@ -378,28 +373,22 @@ DANGEROUS_SERVICE_SIGNATURES: list[dict] = [
 
 
 def detect_dangerous_services(services: list[dict]) -> list[dict]:
-    """Scan a host's service list for known-dangerous banners/versions/ports.
-    Returns a list of vulnerability dicts to inject into nse_vulns."""
     findings: list[dict] = []
     seen_templates: set[str] = set()
-
     for svc in services:
         port = svc.get("port")
         version = (svc.get("version") or "").lower()
         banner = (svc.get("banner") or "").lower()
         combined_text = f"{version} {banner}"
-
         for sig in DANGEROUS_SERVICE_SIGNATURES:
             tid = sig["template_id"]
             if tid in seen_templates:
                 continue
-
             port_match = (sig["match_port"] is None) or (sig["match_port"] == port)
             banner_match = (
                 sig["match_banner_contains"] is None
                 or sig["match_banner_contains"].lower() in combined_text
             )
-
             if port_match and banner_match:
                 seen_templates.add(tid)
                 findings.append({
@@ -416,7 +405,6 @@ def detect_dangerous_services(services: list[dict]) -> list[dict]:
                     "exploit_available": True,
                     "references": [f"https://nvd.nist.gov/vuln/detail/{sig['cve_id']}"] if sig["cve_id"] else [],
                 })
-
     return findings
 
 
@@ -441,29 +429,23 @@ def _parse_vulnerabilities_from_nmap_xml(host_el, host_ip: str) -> list[dict]:
 
 
 def _extract_vuln_from_script_output(script_id: str, output: str, host_ip: str) -> dict | None:
-    # ── Step 1: Check known script severity mapping first ──────────────────────
     known = KNOWN_NSE_SCRIPT_SEVERITIES.get(script_id.lower())
     if known:
         known_sev, known_cvss, known_cve = known
-        # Only use if output doesn't explicitly say "NOT VULNERABLE"
         if "NOT VULNERABLE" in output and "VULNERABLE" not in output.replace("NOT VULNERABLE", ""):
-            return None  # explicitly not vulnerable
+            return None
         severity = known_sev
         cvss_score = known_cvss
         cve_id = known_cve
-        # Still try to extract CVE from output if not in mapping
         if not cve_id:
             cve_match = re.search(r'(CVE-\d{4}-\d{4,})', output, re.I)
             cve_id = cve_match.group(1) if cve_match else None
-        # Also try CVSS from output
         cvss_match = re.search(r'CVSS\s+([\d\.]+)', output, re.I)
         if cvss_match:
             cvss_score = float(cvss_match.group(1))
     else:
-        # ── Step 2: Generic extraction ─────────────────────────────────────────
         cvss_match = re.search(r'CVSS\s+([\d\.]+)', output, re.I)
         cvss_score = float(cvss_match.group(1)) if cvss_match else None
-
         severity = "info"
         if cvss_score is not None:
             if cvss_score >= 9.0:  severity = "critical"
@@ -475,16 +457,12 @@ def _extract_vuln_from_script_output(script_id: str, output: str, host_ip: str) 
             elif "high" in output.lower():    severity = "high"
             elif "medium" in output.lower():  severity = "medium"
             elif "low" in output.lower():     severity = "low"
-            # Key fix: if output explicitly says VULNERABLE but no severity keyword found,
-            # default to medium (not info) — it IS a finding.
             elif "VULNERABLE" in output and "NOT VULNERABLE" not in output:
                 severity = "medium"
-                cvss_score = 5.0  # conservative CVSS estimate
-
+                cvss_score = 5.0
         cve_match = re.search(r'(CVE-\d{4}-\d{4,})', output, re.I)
         cve_id = cve_match.group(1) if cve_match else None
 
-    # ── Step 3: Skip if not actually vulnerable ────────────────────────────────
     if "NOT VULNERABLE" in output and "VULNERABLE" not in output.replace("NOT VULNERABLE", ""):
         return None
 
@@ -508,7 +486,7 @@ def _extract_vuln_from_script_output(script_id: str, output: str, host_ip: str) 
         "description": desc,
         "source": "nmap_nse",
         "remediation": "",
-        "exploit_available": known is not None,  # known scripts are more likely exploitable
+        "exploit_available": known is not None,
         "references": ([f"https://nvd.nist.gov/vuln/detail/{cve_id}"] if cve_id else []),
     }
 
@@ -903,11 +881,9 @@ def _infer_os_from_ports(ports: list[int]) -> str | None:
 def parse_os_details(os_name: str | None) -> tuple[str | None, str | None, str | None]:
     if not os_name:
         return None, None, None
-
     os_lower = os_name.lower()
     family = "Unknown"
     version = None
-
     if "windows" in os_lower:
         family = "Windows"
         m = re.search(r'windows\s+(xp|vista|7|8|8\.1|10|11|2000|2003|2008|2012|2016|2019|2022|nt)', os_lower)
@@ -929,29 +905,14 @@ def parse_os_details(os_name: str | None) -> tuple[str | None, str | None, str |
             version = m.group(1)
     elif "ios" in os_lower and "cisco" not in os_lower:
         family = "iOS"
-        m = re.search(r'(\d+\.\d+)', os_name)
-        if m:
-            version = m.group(1)
     elif "android" in os_lower:
         family = "Android"
-        m = re.search(r'(\d+\.\d+)', os_name)
-        if m:
-            version = m.group(1)
     elif "freebsd" in os_lower or "openbsd" in os_lower or "netbsd" in os_lower:
         family = "BSD"
     elif "cisco" in os_lower:
         family = "Cisco IOS"
     elif "mikrotik" in os_lower or "routeros" in os_lower:
         family = "MikroTik RouterOS"
-    elif "openwrt" in os_lower:
-        family = "OpenWRT"
-    elif "pfsense" in os_lower or "freebsd" in os_lower:
-        family = "pfSense/FreeBSD"
-    elif "synology" in os_lower:
-        family = "Synology DSM"
-    elif "truenas" in os_lower or "freenas" in os_lower:
-        family = "TrueNAS"
-
     return family, version, os_name
 
 
@@ -959,39 +920,32 @@ def detect_vm_docker_wsl(mac_vendor: str | None, hostscripts: dict, services: li
     is_vm = False
     is_docker = False
     is_wsl = False
-
     hname = (hostname or "").lower()
     mv = (mac_vendor or "").lower()
-
     vm_vendors = ["vmware", "virtualbox", "parallels", "xen", "qemu", "red hat", "microsoft hyper-v", "citrix"]
     for v in vm_vendors:
         if v in mv:
             is_vm = True
             break
-
     docker_ports = {2375, 2376, 2377}
     for s in services:
         if s.get("port") in docker_ports:
             is_docker = True
         if "docker" in (s.get("name") or "").lower():
             is_docker = True
-
     if "docker" in hname:
         is_docker = True
-
     if "wsl" in hname or "microsoft" in mv:
         linux_ports = {22, 80}
         has_linux = any(s.get("port") in linux_ports for s in services)
         if has_linux and not is_vm:
             is_wsl = True
-
     for sid, output in hostscripts.items():
         out_lower = output.lower()
         if "vmware" in out_lower or "virtual machine" in out_lower:
             is_vm = True
         if "docker" in out_lower:
             is_docker = True
-
     return is_vm, is_docker, is_wsl
 
 
@@ -1002,92 +956,26 @@ def classify_device(
     hname = (hostname or "").lower()
     mv = (mac_vendor or "").lower()
     ports = {s.get("port") for s in services}
-
     if is_docker:
         return "Container", "Docker Container"
     if is_wsl:
         return "VM", "WSL Instance"
     if is_vm:
         return "VM", "Virtual Machine"
-
-    if mv == PRIVATE_MAC_LABEL.lower() and not ports and (not os_name or os_name == "Unknown"):
-        return "Mobile", "Likely Mobile/IoT Device (Private, Randomized MAC)"
-
-    printer_ports = {515, 631, 9100, 9290}
-    if ports & printer_ports or "printer" in hname or "canon" in mv or "hp" in mv or "epson" in mv or "xerox" in mv:
-        if "canon" in mv:
-            return "Printer", "Canon Printer"
-        if "hp" in mv or "hewlett" in mv:
-            return "Printer", "HP Printer"
-        return "Printer", "Network Printer"
-
-    nas_ports = {5000, 5001, 8200, 111, 2049}
-    if ports & nas_ports or "synology" in hname or "synology" in mv or "qnap" in hname or "qnap" in mv or "nas" in hname:
-        if "synology" in hname or "synology" in mv:
-            return "NAS", "Synology NAS"
-        if "qnap" in hname or "qnap" in mv:
-            return "NAS", "QNAP NAS"
-        return "NAS", "Network Attached Storage"
-
-    if "camera" in hname or "cam" in hname or "hikvision" in mv or "dahua" in mv or "axis" in mv:
-        return "Camera", "IP Camera"
-
-    if "tv" in hname or "samsung" in mv or "lg" in mv or "roku" in mv or "chromecast" in hname:
-        if "samsung" in mv or "samsung" in hname:
-            return "TV", "Samsung Smart TV"
-        if "lg" in mv:
-            return "TV", "LG Smart TV"
-        return "TV", "Smart TV / Media Player"
-
-    if "iphone" in hname or "ipad" in hname or "apple" in mv:
-        if "ipad" in hname:
-            return "Tablet", "Apple iPad"
-        return "Phone", "Apple iPhone"
-    if "android" in hname or "samsung" in mv or "google" in mv or "pixel" in hname:
-        if "tablet" in hname or "tab" in hname:
-            return "Tablet", "Android Tablet"
-        return "Phone", "Android Phone"
-
-    router_ports = {53, 80, 443, 8080, 8443}
-    if ports & {53, 67, 68} or "router" in hname or "gateway" in hname or "tplink" in mv or "netgear" in mv or "asus" in mv or "linksys" in mv or "cisco" in mv or "mikrotik" in mv or "ubiquiti" in mv:
-        if "mikrotik" in mv or "mikrotik" in hname:
-            return "Router", "MikroTik Router"
-        if "ubiquiti" in mv:
-            return "Router", "Ubiquiti Access Point / Router"
-        if "cisco" in mv:
-            return "Router", "Cisco Network Device"
-        return "Router", "Router / Gateway / Firewall"
-
-    if "switch" in hname or "netgear" in mv:
-        return "Switch", "Network Switch"
-
-    if "iot" in hname or "esp" in hname or "arduino" in hname or "raspberry" in hname:
-        if "raspberry" in hname or "raspberry" in mv:
-            return "IoT", "Raspberry Pi"
-        return "IoT", "IoT / Embedded Device"
-
     if os_family == "Windows":
         server_ports = {53, 88, 135, 389, 443, 445, 593, 636, 3268, 3269, 9389}
         if ports & server_ports:
             return "Server", "Windows Server"
         return "Workstation", "Windows Workstation"
-
     if os_family == "Linux":
         server_indicators = {53, 111, 2049, 3306, 5432, 6379, 8080, 8443, 9090}
         if ports & server_indicators or "server" in hname:
             return "Server", "Linux Server"
         return "Workstation", "Linux Workstation"
-
-    if os_family == "macOS":
-        if "macbook" in hname or "imac" in hname or "macmini" in hname:
-            return "Workstation", "Apple Mac"
-        return "Workstation", "macOS Device"
-
     if len(ports) > 15:
         return "Server", "Multi-Service Server"
     if len(ports) > 0:
         return "Workstation", "General Purpose Host"
-
     return "Unknown", "Unknown Device"
 
 
@@ -1096,10 +984,8 @@ async def resolve_os_multi(
     mac_vendor: str | None = None, ttl: int | None = None,
 ) -> tuple[str, str, str | None, str | None]:
     family, version, clean_name = parse_os_details(os_name)
-
     if os_name and os_accuracy >= 85:
         return os_name, "confirmed", family, version
-
     smb_output = hostscripts.get("smb-os-discovery")
     if smb_output:
         m = re.search(r"OS:\s*([^\r\n]+)", smb_output)
@@ -1107,35 +993,25 @@ async def resolve_os_multi(
             smb_os = m.group(1).strip()
             f, v, _ = parse_os_details(smb_os)
             return smb_os, "confirmed", f, v
-
     if os_name:
         return os_name, "inferred", family, version
-
     inferred = _infer_os_from_ports(open_ports)
     if inferred:
         f, v, _ = parse_os_details(inferred)
         return inferred, "inferred", f, v
-
     ttl_guess = _infer_os_from_ttl(ttl, mac_vendor)
     if ttl_guess:
         f, v, _ = parse_os_details(ttl_guess)
         return ttl_guess, "inferred", f, v
-
     if mac_vendor:
         clean_vendor = mac_vendor.split(",")[0].strip()
         return f"{clean_vendor} device (inferred from MAC vendor)", "inferred", "Unknown", None
-
     return "Unknown", "unknown", "Unknown", None
 
 
 HOSTNAME_CONFIDENCE = {
-    "ptr": 0.75,
-    "netbios": 0.80,
-    "smb": 0.85,
-    "mdns": 0.70,
-    "ssh": 0.65,
-    "http": 0.60,
-    "unknown": 0.0,
+    "ptr": 0.75, "netbios": 0.80, "smb": 0.85,
+    "mdns": 0.70, "ssh": 0.65, "http": 0.60, "unknown": 0.0,
 }
 
 def resolve_hostname_multi(
@@ -1143,39 +1019,22 @@ def resolve_hostname_multi(
 ) -> tuple[str, str, float]:
     if nmap_hostname:
         return nmap_hostname, "ptr", HOSTNAME_CONFIDENCE["ptr"]
-
     nbstat_output = hostscripts.get("nbstat")
     if nbstat_output:
         m = re.search(r"NetBIOS name:\s*([^,\r\n]+)", nbstat_output)
         if m:
             return m.group(1).strip(), "netbios", HOSTNAME_CONFIDENCE["netbios"]
-
     smb_output = hostscripts.get("smb-os-discovery")
     if smb_output:
         m = re.search(r"Computer name:\s*([^\r\n]+)", smb_output)
         if m:
             return m.group(1).strip(), "smb", HOSTNAME_CONFIDENCE["smb"]
-
     mdns_name = (mdns_names or {}).get(ip)
     if mdns_name:
         return mdns_name, "mdns", HOSTNAME_CONFIDENCE["mdns"]
-
-    ssh_output = hostscripts.get("ssh-hostkey")
-    if ssh_output:
-        m = re.search(r"Host:\s*([^\s\r\n]+)", ssh_output)
-        if m:
-            return m.group(1).strip(), "ssh", HOSTNAME_CONFIDENCE["ssh"]
-
-    http_title = hostscripts.get("http-title")
-    if http_title:
-        clean = http_title.strip().split("\n")[0][:30]
-        if clean and clean != "Site doesn't have a title":
-            return clean, "http", HOSTNAME_CONFIDENCE["http"]
-
     dns_name = _resolve_hostname_via_dns(ip)
     if dns_name:
         return dns_name, "ptr", HOSTNAME_CONFIDENCE["ptr"]
-
     return "Unknown", "unknown", 0.0
 
 
@@ -1193,10 +1052,6 @@ def extract_cve_from_template_id(template_id: str) -> str | None:
 
 
 def compute_health_score(all_vulns: list[dict]) -> int:
-    """Compute a 0-100 health score from discovered vulnerabilities.
-    Weights are calibrated so that a single critical vuln drops the score
-    significantly (e.g. 1 critical → ~75, 3 criticals → ~25).
-    """
     weights = {"critical": 25, "high": 10, "medium": 4, "low": 1, "info": 0}
     risk = sum(weights.get((v.get("severity") or "info").lower(), 0) for v in all_vulns)
     return max(0, 100 - risk)
@@ -1217,12 +1072,10 @@ def _parse_nuclei_jsonl(path: Path) -> list[dict]:
                 classification = info.get("classification", {})
                 template_id  = data.get("template-id", "") or ""
                 severity     = (info.get("severity") or "info").lower()
-
                 cve_list = classification.get("cve-id") or []
                 cve_from_class = cve_list[0] if cve_list else None
                 cve_from_tmpl  = extract_cve_from_template_id(template_id)
                 cve_id = cve_from_class or cve_from_tmpl
-
                 raw_cvss = classification.get("cvss-score")
                 if raw_cvss is not None:
                     try:
@@ -1234,20 +1087,12 @@ def _parse_nuclei_jsonl(path: Path) -> list[dict]:
                 else:
                     cvss_score     = _SEVERITY_CVSS.get(severity, 0.5)
                     cvss_estimated = True
-
-                matcher_name = (
-                    data.get("matcher-name")
-                    or template_id
-                    or "default"
-                )
-
+                matcher_name = data.get("matcher-name") or template_id or "default"
                 refs = []
                 if classification.get("cwe-id"):
                     refs.append(f"CWE-{classification['cwe-id'][0]}" if isinstance(classification['cwe-id'], list) else f"CWE-{classification['cwe-id']}")
-
                 tags = info.get("tags", [])
                 exploit_available = any(t in str(tags).lower() for t in ["rce", "exploit", "cve"])
-
                 vulns.append({
                     "template_id":    template_id,
                     "name":           info.get("name") or "Unknown vulnerability",
@@ -1272,15 +1117,13 @@ def _parse_nuclei_jsonl(path: Path) -> list[dict]:
 _sem = asyncio.Semaphore(15)
 
 # =============================================================================
-# NMAP SCRIPT SETS
+# NMAP SCRIPT SETS (ULTIMATE HEAVY SCAN)
 # =============================================================================
-# Full script set used for ALL hosts (deep scan)
 NMAP_SCRIPT_SET = (
-    "default,discovery,auth,vuln,banner,"
-    "http-*,ssl-*,ftp-anon,"
-    "smb-os-discovery,smb-enum-shares,nbstat,snmp-info,"
-    "ssh-hostkey,ssh-brute,dns-service-discovery,"
-    "upnp-info,nbstat,smb-security-mode"
+    "default,discovery,auth,vuln,banner,exploit,dos,brute,intrusive,"
+    "http-*,ssl-*,ftp-anon,smb-os-discovery,smb-enum-shares,nbstat,snmp-info,"
+    "ssh-hostkey,ssh-brute,dns-service-discovery,upnp-info,smb-security-mode,"
+    "mysql-empty-password,oracle-enum-users,rdp-enum-encryption"
 )
 
 # =============================================================================
@@ -1324,7 +1167,6 @@ async def run_arp_cache_discovery(target: str) -> set[str]:
             tasks = [_ping_host(str(ip)) for ip in net.hosts()]
             for i in range(0, len(tasks), 50):
                 await asyncio.gather(*tasks[i:i+50])
-
         output = await asyncio.to_thread(subprocess.check_output, ["arp", "-a"], text=True)
         for line in output.splitlines():
             parts = line.strip().split()
@@ -1349,17 +1191,14 @@ async def discover_hosts(target: str) -> set[str]:
         run_arp_cache_discovery(target),
         return_exceptions=True
     )
-
     layer1 = results[0] if isinstance(results[0], set) else set()
     layer2 = results[1] if isinstance(results[1], set) else set()
     layer3 = results[2] if isinstance(results[2], set) else set()
     layer4 = results[3] if isinstance(results[3], set) else set()
-
     logger.info(f"[DISCOVERY] Layer 1 (Nmap ARP): {len(layer1)} hosts")
     logger.info(f"[DISCOVERY] Layer 2 (Nmap ICMP): {len(layer2)} hosts")
     logger.info(f"[DISCOVERY] Layer 3 (Nmap TCP): {len(layer3)} hosts")
     logger.info(f"[DISCOVERY] Layer 4 (OS ARP Cache): {len(layer4)} hosts")
-
     all_ips = layer1 | layer2 | layer3 | layer4
     logger.info(f"[DISCOVERY] Total unique live hosts: {len(all_ips)}")
     return all_ips
@@ -1377,7 +1216,6 @@ async def _enrich_host_result(
     mdns_names: dict[str, str] | None, gateway_ip: str | None, local_ips: set[str] | None,
 ) -> dict:
     open_ports = [s["port"] for s in result.get("services", [])]
-
     if not result.get("mac"):
         result["mac"] = (arp_snapshot or {}).get(ip) or await asyncio.to_thread(_get_mac_from_arp, ip)
     if not result.get("mac_vendor"):
@@ -1417,99 +1255,170 @@ async def _enrich_host_result(
     result["device_type"] = dev_type
     result["device_classification"] = dev_class
     result["manufacturer"] = result.get("mac_vendor") or "Unknown"
-
     result["is_gateway"] = (gateway_ip is not None and ip == gateway_ip)
     result["is_local_machine"] = (local_ips is not None and ip in local_ips)
-
     return result
 
-
 async def service_scan_host(ip: str, arp_snapshot: dict[str, str] | None = None,
-                           mdns_names: dict[str, str] | None = None,
-                           gateway_ip: str | None = None, local_ips: set[str] | None = None,
-                           attempt: int = 1, max_attempts: int = 2) -> dict | None:
+                            mdns_names: dict[str, str] | None = None,
+                            gateway_ip: str | None = None, local_ips: set[str] | None = None,
+                            attempt: int = 1, max_attempts: int = 2) -> dict | None:
     """
-    EXTREME DEEP scan for ALL hosts.
-    Scans ALL 65535 ports, uses -A, and is very aggressive.
-    No hard timeout on the subprocess – Nmap's --host-timeout is set to 60 minutes.
+    ULTIMATE HEAVY SCAN: Full TCP (1-65535) + Top 1000 UDP + Aggressive OS + All Scripts.
     """
     async with _sem:
-        logger.info(f"[SERVICE SCAN - EXTREME] Starting EXTREME scan → {ip} (attempt {attempt}/{max_attempts})")
+        logger.info(f"[HEAVY SCAN] Starting ULTIMATE Nmap scan → {ip} (attempt {attempt}/{max_attempts})")
         t0 = asyncio.get_event_loop().time()
         tmp = Path(tempfile.mktemp(suffix=f"_{ip.replace('.','_')}.xml"))
         try:
-            # Build the most aggressive Nmap command possible
-            cmd = [
-                NMAP_PATH,
-                "-Pn",           # Treat all hosts as up
-                "-sS",           # SYN stealth scan (faster)
-                "-sV",           # Version detection
-                "--version-all", # Try all version probes
-                "-A",            # OS detection, traceroute, and script scan
-                "-p-",           # ALL 65535 ports
-                "--min-rate", "100",   # Minimum packet rate
-                "--max-retries", "2",
-                "--min-parallelism", "50",
-                "--script", NMAP_SCRIPT_SET,
-                "--script-timeout", "5m",
-                "-T4",           # Aggressive timing
-                "--open",        # Only show open ports
-                "--host-timeout", "60m",   # 1 hour per host – you can increase or remove
-                "-oX", str(tmp),
-                ip,
-            ]
-
-            # Add OS detection with higher confidence if admin
-            if is_admin():
-                cmd += ["-O", "--osscan-guess", "--max-os-tries", "3"]
+            is_windows = sys.platform == "win32"
+            has_admin = is_admin()
+            
+            if is_windows and not has_admin:
+                # Windows Non-Admin: TCP Connect + Scripts (Top 10000 ports for speed/coverage balance)
+                cmd = [
+                    NMAP_PATH, "-Pn", "-sT",
+                    "--top-ports", "10000",  # 🚀 Scans the 10,000 most common ports (covers ~99% of services)
+                    "-sV", "--version-all",
+                    "--script", NMAP_SCRIPT_SET,
+                    "--script-timeout", "10m",
+                    "--min-rate", "300", "--max-retries", "2", # Reduced retries slightly for speed
+                    "-T4", "--reason", "--open",
+                    "--host-timeout", "45m", # 🚀 Reduced from 120m to 45m since we scan fewer ports
+                    "-oX", str(tmp), ip,
+                ]
+                logger.info(f"[{ip}] Windows Non-Admin — Heavy TCP Connect Scan (Top 10000 Ports)")
             else:
-                logger.info(f"[{ip}] Running without Admin rights — skipping OS detection (-O).")
+                # Admin/Unix: FULL AGGRESSIVE TCP + UDP + OS + Traceroute
+                cmd = [
+                    NMAP_PATH, "-Pn", "-sS", "-sU",
+                    "-p", "T:1-65535,U:1-1000", # All 65535 TCP + Top 1000 UDP
+                    "-sV", "--version-all",
+                    "-A", "-O", "--osscan-guess", "--max-os-tries", "5",
+                    "--script", NMAP_SCRIPT_SET,
+                    "--script-timeout", "10m",
+                    "--min-rate", "500", "--max-retries", "3",
+                    "-T4", "--reason", "--open",
+                    "--host-timeout", "180m",
+                    "-oX", str(tmp), ip,
+                ]
+                logger.info(f"[{ip}] Admin/Unix — ULTIMATE Aggressive TCP+UDP+OS Scan")
 
-            # Run subprocess with no timeout (None) – we rely on Nmap's --host-timeout
+            # ── Run nmap — capture stdout for real command evidence ─────────
             proc = await asyncio.to_thread(
                 subprocess.run, cmd,
-                capture_output=True, check=False, timeout=None,  # No subprocess timeout
+                capture_output=True, check=False, timeout=None,
             )
+            nmap_stdout = (proc.stdout or b"").decode(errors="replace")
+            nmap_stderr = (proc.stderr or b"").decode(errors="replace")
             result = _parse_service_xml(tmp)
-
+            
             if result is not None:
                 result = await _enrich_host_result(result, ip, arp_snapshot, mdns_names, gateway_ip, local_ips)
-                result["discovery_method"] = "deep-scan-extreme"
-                # Inject dangerous-service signature findings into nse_vulns
+                result["discovery_method"] = "ultimate-heavy-scan"
+                
+                # Inject dangerous-service signature findings
                 sig_vulns = detect_dangerous_services(result.get("services", []))
                 result["nse_vulns"] = result.get("nse_vulns", []) + sig_vulns
                 if sig_vulns:
-                    logger.warning(
-                        f"[SERVICE SCAN] {ip} — {len(sig_vulns)} dangerous service signature(s) detected: "
-                        + ", ".join(v['name'] for v in sig_vulns)
-                    )
+                    logger.warning(f"[HEAVY SCAN] {ip} — {len(sig_vulns)} dangerous service signature(s) detected")
+                
+                # Store REAL nmap command + stdout as command evidence
+                nmap_evidence = build_command_evidence(
+                    tool="nmap", cmd=cmd, stdout=nmap_stdout, stderr=nmap_stderr, ip=ip,
+                    label=f"Ultimate Nmap Scan exécuté sur {ip} ({len(result.get('services', []))} ports ouverts)",
+                )
+                result.setdefault("evidence", []).append(nmap_evidence)
+                
+                duration = asyncio.get_event_loop().time() - t0
+                logger.info(f"[HEAVY SCAN] {ip} — {len(result['services'])} ports open, OS: {result['os']} — {duration:.1f}s")
+                return result
+                
+            stderr_tail = nmap_stderr[-400:]
+            logger.warning(f"[HEAVY SCAN] No XML/host-up result for {ip} (rc={getattr(proc, 'returncode', '?')}). stderr: {stderr_tail!r}")
+            
+            if attempt < max_attempts:
+                logger.warning(f"[HEAVY SCAN] Empty/failed result for {ip}, retrying once")
+                return await service_scan_host(ip, arp_snapshot, mdns_names, gateway_ip, local_ips, attempt + 1, max_attempts)
+                
+            logger.warning(f"[HEAVY SCAN] Full scan failed for {ip}, attempting basic scan fallback")
+            basic_result = await basic_scan_host(ip, arp_snapshot, mdns_names, gateway_ip, local_ips)
+            if basic_result:
+                return basic_result
+                
+            logger.error(f"[HEAVY SCAN] Giving up on {ip} after {max_attempts} attempts")
+            return None
+            
+        except Exception as exc:
+            logger.error(f"[HEAVY SCAN] Error on {ip}: {exc}")
+            if attempt < max_attempts:
+                return await service_scan_host(ip, arp_snapshot, mdns_names, gateway_ip, local_ips, attempt + 1, max_attempts)
+            return None
+        finally:
+            tmp.unlink(missing_ok=True)
 
+async def basic_scan_host(ip: str, arp_snapshot: dict[str, str] | None = None,
+                          mdns_names: dict[str, str] | None = None,
+                          gateway_ip: str | None = None, local_ips: set[str] | None = None) -> dict | None:
+    """
+    Basic scan fallback using common ports only, more reliable on Windows.
+    Uses -sT (TCP connect) which works without admin privileges.
+    """
+    async with _sem:
+        logger.info(f"[BASIC SCAN] Starting basic scan → {ip}")
+        t0 = asyncio.get_event_loop().time()
+        tmp = Path(tempfile.mktemp(suffix=f"_{ip.replace('.','_')}_basic.xml"))
+        try:
+            # Common ports only for faster, more reliable scan
+            common_ports = "21,22,23,25,53,80,110,135,139,143,443,445,3306,3389,5432,5900,8080,8443"
+            
+            cmd = [
+                NMAP_PATH,
+                "-Pn", "-sT", "-sV", "--version-intensity", "5",
+                "-p", common_ports,
+                "--min-rate", "50", "--max-retries", "1",
+                "-T3", "--open", "--host-timeout", "5m",
+                "-oX", str(tmp), ip,
+            ]
+            
+            proc = await asyncio.to_thread(
+                subprocess.run, cmd,
+                capture_output=True, check=False, timeout=None,
+            )
+            
+            nmap_stdout = (proc.stdout or b"").decode(errors="replace")
+            nmap_stderr = (proc.stderr or b"").decode(errors="replace")
+            
+            result = _parse_service_xml(tmp)
+            
+            if result is not None:
+                result = await _enrich_host_result(result, ip, arp_snapshot, mdns_names, gateway_ip, local_ips)
+                result["discovery_method"] = "basic-scan-fallback"
+                
+                # Store command evidence
+                nmap_evidence = build_command_evidence(
+                    tool="nmap",
+                    cmd=cmd,
+                    stdout=nmap_stdout,
+                    stderr=nmap_stderr,
+                    ip=ip,
+                    label=f"Scan Nmap basique (fallback) exécuté sur {ip} ({len(result.get('services', []))} ports ouverts détectés)",
+                )
+                result.setdefault("evidence", []).append(nmap_evidence)
+                
                 duration = asyncio.get_event_loop().time() - t0
                 logger.info(
-                    f"[SERVICE SCAN - EXTREME] {ip} — {len(result['services'])} ports open, "
-                    f"OS: {result['os']} ({result['os_confidence']}), device: {result['device_classification']}, "
-                    f"hostname: {result['hostname']} ({result['hostname_source']}) — {duration:.1f}s"
+                    f"[BASIC SCAN] {ip} — {len(result['services'])} ports open, "
+                    f"OS: {result['os']}, device: {result['device_classification']}, "
+                    f"hostname: {result['hostname']} — {duration:.1f}s"
                 )
                 return result
-
-            stderr_tail = (proc.stderr or b"").decode(errors="replace")[-400:] if proc else ""
-            logger.warning(f"[SERVICE SCAN - EXTREME] No XML/host-up result for {ip} (rc={getattr(proc, 'returncode', '?')}). stderr: {stderr_tail!r}")
-
-            if attempt < max_attempts:
-                logger.warning(f"[SERVICE SCAN - EXTREME] Empty/failed result for {ip}, retrying once")
-                return await service_scan_host(ip, arp_snapshot, mdns_names, gateway_ip, local_ips, attempt + 1, max_attempts)
-            logger.error(f"[SERVICE SCAN - EXTREME] Giving up on {ip} after {max_attempts} attempts")
+            
+            logger.warning(f"[BASIC SCAN] No result for {ip}")
             return None
-
-        except subprocess.TimeoutExpired:
-            # This shouldn't happen since timeout=None, but keep it for safety.
-            duration = asyncio.get_event_loop().time() - t0
-            logger.error(f"[SERVICE SCAN - EXTREME] Subprocess timeout (unexpected) on {ip} after {duration:.0f}s — not retrying")
-            return None
+            
         except Exception as exc:
-            logger.error(f"[SERVICE SCAN - EXTREME] Error on {ip}: {exc}")
-            if attempt < max_attempts:
-                return await service_scan_host(ip, arp_snapshot, mdns_names, gateway_ip, local_ips, attempt + 1, max_attempts)
+            logger.error(f"[BASIC SCAN] Error on {ip}: {exc}")
             return None
         finally:
             tmp.unlink(missing_ok=True)
@@ -1517,95 +1426,106 @@ async def service_scan_host(ip: str, arp_snapshot: dict[str, str] | None = None,
 
 WEB_PORTS = {80, 443, 8080, 8443, 3000, 8000, 8888, 9090, 9443, 4443}
 HTTPS_PORTS = {443, 8443, 9443, 4443}
-# Non-web service ports that nuclei can still test with network-level CVE templates
 NETWORK_NUCLEI_PORTS = {21, 22, 23, 25, 53, 110, 143, 3306, 5432, 6379, 5900, 2049, 1099, 2121}
 
-async def nuclei_scan_host(ip: str, open_ports: list[int]) -> list[dict]:
-    web_ports = [p for p in open_ports if p in WEB_PORTS]
-    # Also scan known non-web ports for CVE-tagged network templates
-    network_ports = [p for p in open_ports if p in NETWORK_NUCLEI_PORTS and p not in WEB_PORTS]
+async def nuclei_scan_host(ip: str, open_ports: list[int]) -> tuple[list[dict], list[dict]]:
+    """
+    ULTIMATE NUCLEI SCAN: Runs maximum templates with high concurrency on all standard ports.
+    """
+    # Skip high ephemeral/RPC ports (>10000) to prevent infinite hangs
+    open_ports = [p for p in open_ports if p <= 10000]
 
-    if not web_ports and not network_ports:
-        return []
-
-    async def _scan_web_port(port: int, attempt: int = 1, max_attempts: int = 2) -> list[dict]:
-        scheme = "https" if port in HTTPS_PORTS else "http"
-        url = f"{scheme}://{ip}:{port}"
-        tmp = Path(tempfile.mktemp(suffix=f"_nuclei_{ip.replace('.','_')}_{port}.json"))
-        try:
-            cmd = [
-                NUCLEI_PATH,
-                "-u", url,
-                "-tags", "cve,vuln,default-login,panel,rce,lfi,sqli,xss,exposure,misconfig,auth-bypass",
-                "-severity", "critical,high,medium,low,info",
-                "-jsonl",
-                "-o", str(tmp),
-                "-silent",
-                "-ni",
-                "-duc",
-                "-timeout", "10",
-                "-retries", "1",
-            ]
-            async with _sem:
-                await asyncio.to_thread(
-                    subprocess.run, cmd,
-                    capture_output=True, check=False, timeout=180,
-                )
-            vulns = _parse_nuclei_jsonl(tmp)
-            logger.info(f"[NUCLEI] {ip}:{port} (web) — {len(vulns)} vulnerabilities found")
-            return vulns
-        except subprocess.TimeoutExpired:
-            logger.error(f"[NUCLEI] Timed out on {ip}:{port} — not retrying")
-            return []
-        except Exception as exc:
-            logger.error(f"[NUCLEI] Error on {ip}:{port}: {exc}")
-            if attempt < max_attempts:
-                return await _scan_web_port(port, attempt + 1, max_attempts)
-            return []
-        finally:
-            tmp.unlink(missing_ok=True)
-
-    async def _scan_network_port(port: int) -> list[dict]:
-        """Run nuclei CVE templates against non-web services (FTP, SSH, MySQL, etc.)."""
-        target_url = f"{ip}:{port}"
-        tmp = Path(tempfile.mktemp(suffix=f"_nuclei_net_{ip.replace('.','_')}_{port}.json"))
-        try:
-            cmd = [
-                NUCLEI_PATH,
-                "-u", target_url,
-                "-tags", "cve,default-login,network",
-                "-severity", "critical,high,medium,low",
-                "-jsonl",
-                "-o", str(tmp),
-                "-silent",
-                "-ni",
-                "-duc",
-                "-timeout", "8",
-                "-retries", "0",
-            ]
-            async with _sem:
-                await asyncio.to_thread(
-                    subprocess.run, cmd,
-                    capture_output=True, check=False, timeout=120,
-                )
-            vulns = _parse_nuclei_jsonl(tmp)
-            if vulns:
-                logger.info(f"[NUCLEI] {ip}:{port} (network) — {len(vulns)} CVE findings")
-            return vulns
-        except Exception as exc:
-            logger.debug(f"[NUCLEI] Network scan skipped for {ip}:{port}: {exc}")
-            return []
-        finally:
-            tmp.unlink(missing_ok=True)
-
-    web_tasks = [_scan_web_port(p) for p in web_ports]
-    net_tasks = [_scan_network_port(p) for p in network_ports]
-    results = await asyncio.gather(*(web_tasks + net_tasks), return_exceptions=True)
+    if not open_ports:
+        logger.info(f"[NUCLEI] No open ports for {ip} - skipping nuclei scan")
+        return [], []
+        
     all_vulns: list[dict] = []
-    for r in results:
-        if isinstance(r, list):
-            all_vulns.extend(r)
-    return all_vulns
+    all_cmd_evidence: list[dict] = []
+
+    async def _scan_port(port: int, attempt: int = 1, max_attempts: int = 3) -> tuple[list[dict], dict | None]:
+        tmp = Path(tempfile.mktemp(suffix=f"_nuclei_{ip.replace('.','_')}_{port}.json"))
+        
+        if port in WEB_PORTS:
+            scheme = "https" if port in HTTPS_PORTS else "http"
+            target_url = f"{scheme}://{ip}:{port}"
+        else:
+            target_url = f"{ip}:{port}"
+
+        # ULTIMATE NUCLEI COMMAND (Max Tags, Max Concurrency, Max Retries)
+        cmd = [
+            NUCLEI_PATH,
+            "-u", target_url,
+            "-severity", "critical,high,medium,low,info",
+            "-tags", "cve,vuln,default-login,panel,rce,lfi,sqli,xss,exposure,misconfig,auth-bypass,takeover,network,dns,ftp,ssh,smtp,mysql,oracle,mssql,rdp,redis,wordpress,joomla,sap",
+            "-retries", "3",
+            "-timeout", "60",
+            "-c", "100",               # 100 concurrent templates
+            "-bulk-size", "100",
+            "-rate-limit", "500",       # 500 requests per second
+            "-jsonl", "-o", str(tmp),
+            "-silent", "-ni", "-duc",
+            "-fhr",                    # Follow HTTP redirects
+            "-ipt",                    # Include payload/templates
+        ]
+        
+        try:
+            async with _sem:
+                proc = await asyncio.to_thread(
+                    subprocess.run, cmd,
+                    capture_output=True, check=False, timeout=900, # 15 min timeout per port
+                )
+            nuclei_stdout = (proc.stdout or b"").decode(errors="replace")
+            nuclei_stderr = (proc.stderr or b"").decode(errors="replace")
+            vulns = _parse_nuclei_jsonl(tmp)
+            logger.info(f"[NUCLEI HEAVY] {ip}:{port} — {len(vulns)} vulnerabilities found")
+            
+            if vulns:
+                findings_summary = "\n".join(
+                    f"  [{v['severity'].upper()}] {v['name']}" + (f" ({v['cve_id']})" if v.get('cve_id') else "")
+                    for v in vulns[:20]
+                )
+                if len(vulns) > 20:
+                    findings_summary += f"\n  ... et {len(vulns) - 20} finding(s) supplémentaire(s)"
+                combined_output = (nuclei_stdout.strip() + "\n\n" + findings_summary).strip()
+            else:
+                combined_output = nuclei_stdout.strip() or "Aucun finding détecté sur cette cible."
+                
+            cmd_ev = build_command_evidence(
+                tool="nuclei", cmd=cmd, stdout=combined_output, stderr=nuclei_stderr,
+                ip=ip, port=port,
+                label=f"Ultimate Nuclei Scan sur {ip}:{port} — {len(vulns)} finding(s)",
+            )
+            return vulns, cmd_ev
+            
+        except subprocess.TimeoutExpired:
+            logger.error(f"[NUCLEI HEAVY] Timed out on {ip}:{port} (attempt {attempt}/{max_attempts})")
+            if attempt < max_attempts:
+                return await _scan_port(port, attempt + 1, max_attempts)
+            return [], None
+        except Exception as exc:
+            logger.error(f"[NUCLEI HEAVY] Error on {ip}:{port}: {exc}")
+            if attempt < max_attempts:
+                return await _scan_port(port, attempt + 1, max_attempts)
+            return [], None
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    # Scan all ports concurrently
+    scan_tasks = [_scan_port(port) for port in open_ports]
+    scan_results = await asyncio.gather(*scan_tasks, return_exceptions=True)
+    
+    for result in scan_results:
+        if isinstance(result, Exception):
+            continue
+        if result:
+            vulns, cmd_ev = result
+            if vulns:
+                all_vulns.extend(vulns)
+            if cmd_ev:
+                all_cmd_evidence.append(cmd_ev)
+                
+    logger.info(f"[NUCLEI HEAVY] {ip} — Total: {len(all_vulns)} vulnerabilities across {len(open_ports)} ports")
+    return all_vulns, all_cmd_evidence
 
 
 async def persist_results(scan_id: str, host_results: list[dict]) -> None:
@@ -1613,7 +1533,6 @@ async def persist_results(scan_id: str, host_results: list[dict]) -> None:
     async with AsyncSessionLocal() as session:
         async with session.begin():
             await session.execute(delete(Host).where(Host.scan_id == scan_id))
-
             for hr in host_results:
                 host = Host(
                     scan_id=scan_id,
@@ -1652,10 +1571,6 @@ async def persist_results(scan_id: str, host_results: list[dict]) -> None:
                 session.add(host)
                 await session.flush()
 
-
-
-
-
                 for svc in hr.get("services", []):
                     session.add(Service(
                         host_id=host.id,
@@ -1681,9 +1596,7 @@ async def persist_results(scan_id: str, host_results: list[dict]) -> None:
                         cvss_score = None
                     cvss_estimated = bool(vuln.get("cvss_estimated", False))
                     matcher_name = (
-                        vuln.get("matcher_name")
-                        or vuln.get("template_id")
-                        or "default"
+                        vuln.get("matcher_name") or vuln.get("template_id") or "default"
                     )
                     session.add(Vulnerability(
                         host_id=host.id,
@@ -1713,19 +1626,14 @@ async def persist_results(scan_id: str, host_results: list[dict]) -> None:
             )
 
 
-# =============================================================================
-# FIXED: async fallback host result (no asyncio.run)
-# =============================================================================
 async def _fallback_host_result(
     ip: str, arp_snapshot: dict, mdns_names: dict, gateway_ip: str | None, local_ips: set,
     mac: str | None, mac_vendor: str | None,
 ) -> dict:
-    """Async fallback record for a host that couldn't be scanned."""
     hostname, hostname_source, hostname_confidence = resolve_hostname_multi(ip, None, {}, mdns_names)
     os_name, os_confidence, os_family, os_version = await resolve_os_multi(None, 0, {}, [], mac_vendor, None)
     is_vm, is_docker, is_wsl = detect_vm_docker_wsl(mac_vendor, {}, [], hostname)
     dev_type, dev_class = classify_device(os_name, os_family, mac_vendor, [], hostname, is_vm, is_docker, is_wsl)
-
     return {
         "ip": ip,
         "hostname": hostname,
@@ -1749,6 +1657,7 @@ async def _fallback_host_result(
         "vulns": [],
         "cred_vulns": [],
         "nse_vulns": [],
+        "evidence": [],
         "discovery_method": "fallback-unreachable",
         "risk_score": 0.0,
         "criticality": "Low",
@@ -1756,7 +1665,7 @@ async def _fallback_host_result(
 
 
 # =============================================================================
-# run_pipeline with async fallback calls and EVIDENCE CAPTURE
+# MAIN PIPELINE
 # =============================================================================
 async def run_pipeline(scan_id: str, target: str) -> None:
     logger.info(f"[SCAN START] scan_id={scan_id} target={target}")
@@ -1801,20 +1710,15 @@ async def run_pipeline(scan_id: str, target: str) -> None:
             live_ips_list.remove(target_ip)
             live_ips_list.insert(0, target_ip)
 
-        logger.info(
-            f"[PIPELINE] {len(live_ips_list)} host(s) discovered. "
-            f"ALL hosts will receive an EXTREME deep scan (nmap -Pn -sS -sV -A -p- --script full)."
-        )
+        logger.info(f"[PIPELINE] {len(live_ips_list)} host(s) discovered.")
 
         mdns_names = await asyncio.to_thread(snapshot_mdns_names, 4.0)
         arp_snapshot = await asyncio.to_thread(snapshot_arp_table)
         local_macs = await asyncio.to_thread(get_local_interface_macs)
         arp_snapshot.update(local_macs)
-        logger.info(f"[PIPELINE] ARP snapshot captured: {len(arp_snapshot)} entries")
-
         await ensure_mac_vendor_db_loaded()
 
-        # EXTREME deep scan for EVERY host
+        # Deep scan for every host
         scan_tasks = [service_scan_host(ip, arp_snapshot, mdns_names, gateway_ip, local_ips) for ip in live_ips_list]
         scan_raw = await asyncio.gather(*scan_tasks, return_exceptions=True)
 
@@ -1833,16 +1737,14 @@ async def run_pipeline(scan_id: str, target: str) -> None:
                 mac_vendor = await guess_vendor_from_mac(mac)
                 host_results.append(await _fallback_host_result(ip, arp_snapshot, mdns_names, gateway_ip, local_ips, mac, mac_vendor))
 
-        if len(host_results) != len(live_ips_list):
-            logger.warning(
-                f"[PIPELINE] host_results ({len(host_results)}) != discovered hosts ({len(live_ips_list)}) — reconciling"
-            )
-            seen_ips = {hr["ip"] for hr in host_results}
-            for ip in live_ips_list:
-                if ip not in seen_ips:
-                    host_results.append(await _fallback_host_result(ip, arp_snapshot, mdns_names, gateway_ip, local_ips, arp_snapshot.get(ip), None))
+        # Reconcile
+        seen_ips = {hr["ip"] for hr in host_results}
+        for ip in live_ips_list:
+            if ip not in seen_ips:
+                host_results.append(await _fallback_host_result(ip, arp_snapshot, mdns_names, gateway_ip, local_ips, arp_snapshot.get(ip), None))
 
-        # Nuclei on web ports for ALL hosts
+        # Nuclei on web + network ports for ALL hosts
+        # nuclei_scan_host now returns (vulns, cmd_evidence_list)
         nuclei_tasks = [
             nuclei_scan_host(hr["ip"], [s["port"] for s in hr.get("services", [])])
             for hr in host_results
@@ -1854,13 +1756,16 @@ async def run_pipeline(scan_id: str, target: str) -> None:
                 logger.error(f"[NUCLEI] Unexpected error for host {host_results[i]['ip']}: {res}")
                 host_results[i]["vulns"] = []
             else:
-                host_results[i]["vulns"] = res
+                vulns, cmd_evidence_list = res
+                host_results[i]["vulns"] = vulns
+                # Append real nuclei command evidence to this host's evidence list
+                for cmd_ev in cmd_evidence_list:
+                    host_results[i].setdefault("evidence", []).append(cmd_ev)
 
         # Credential testing
         logger.info("[CRED TEST] Starting credential testing stage")
         cred_test_tasks = [run_credential_tests(hr) for hr in host_results]
         cred_results_raw = await asyncio.gather(*cred_test_tasks, return_exceptions=True)
-
         for i, res in enumerate(cred_results_raw):
             if isinstance(res, Exception):
                 logger.error(f"[CRED TEST] Error for host {host_results[i]['ip']}: {res}")
@@ -1871,9 +1776,10 @@ async def run_pipeline(scan_id: str, target: str) -> None:
         # ── EVIDENCE CAPTURE ────────────────────────────────────────────────
         logger.info("[EVIDENCE] Capturing screenshots and text evidence")
         for hr in host_results:
-            hr["evidence"] = []
-            hr["screenshot_path"] = None
-            # 1. Web screenshots for each open web port
+            hr.setdefault("evidence", [])
+            hr.setdefault("screenshot_path", None)
+
+            # Web screenshots for each open web port
             for svc in hr.get("services", []):
                 port = svc.get("port")
                 if port in WEB_PORTS:
@@ -1890,18 +1796,16 @@ async def run_pipeline(scan_id: str, target: str) -> None:
                         if not hr["screenshot_path"]:
                             hr["screenshot_path"] = path_str
 
-            # 2. Credential evidence (auth screenshots for web, text for others)
+            # Credential evidence
             for cred in hr.get("cred_vulns", []):
                 if cred.get("vulnerable") and cred.get("credentials_found"):
                     service = cred.get("service", "")
                     port = cred.get("port", 0)
                     if port in WEB_PORTS and service.lower() in ["http", "https", "web"]:
-                        # Try auth screenshot for each found credential
                         for c in cred["credentials_found"]:
                             url = f"http://{hr['ip']}:{port}" if port != 443 else f"https://{hr['ip']}:{port}"
                             auth_path = await capture_auth_screenshot(
-                                scan_id, hr['ip'], port, url,
-                                c["username"], c["password"]
+                                scan_id, hr['ip'], port, url, c["username"], c["password"]
                             )
                             if auth_path:
                                 path_str = str(auth_path)
@@ -1912,16 +1816,14 @@ async def run_pipeline(scan_id: str, target: str) -> None:
                                 })
                                 if not hr["screenshot_path"]:
                                     hr["screenshot_path"] = path_str
-                                break  # stop after first success
+                                break
                     else:
-                        # Non-web: text evidence
                         text_ev = capture_credential_text(
-                            scan_id, hr['ip'], port, service,
-                            cred["credentials_found"]
+                            scan_id, hr['ip'], port, service, cred["credentials_found"]
                         )
                         hr["evidence"].append(text_ev)
 
-        # Convert raw credential results to proper vulnerability dicts for DB/scoring/enrichment
+        # Convert credential results to vulnerability dicts
         for hr in host_results:
             raw_creds = hr.get("cred_vulns", [])
             converted = credential_results_to_vulnerabilities(None, raw_creds)
@@ -1934,7 +1836,6 @@ async def run_pipeline(scan_id: str, target: str) -> None:
             all_vulns.extend(hr.get("vulns", []))
             all_vulns.extend(hr.get("cred_vulns", []))
             all_vulns.extend(hr.get("nse_vulns", []))
-
         if all_vulns:
             enriched_vulns = await enrich_vulnerabilities_list(all_vulns)
             vuln_index = 0
@@ -1949,28 +1850,22 @@ async def run_pipeline(scan_id: str, target: str) -> None:
         # Risk scoring
         for hr in host_results:
             all_vulns_for_host = hr.get("vulns", []) + hr.get("cred_vulns", []) + hr.get("nse_vulns", [])
-            score = calculate_host_risk_score(
-                all_vulns_for_host,
-                hr.get("services", []),
-                hr.get("cred_vulns", [])
-            )
+            score = calculate_host_risk_score(all_vulns_for_host, hr.get("services", []), hr.get("cred_vulns", []))
             hr["risk_score"] = score
             hr["criticality"] = criticality_from_score(score)
 
         # Persist
         await persist_results(scan_id, host_results)
 
-        # AI Audit Analysis (fallback if Ollama not available)
+        # AI Audit Analysis
         logger.info("[AI ANALYSIS] Generating scan-level audit analysis")
         try:
             from services.audit_analysis import generate_audit_analysis, persist_audit_analysis
-            analysis = await asyncio.wait_for(generate_audit_analysis(scan_id), timeout=150)
+            analysis = await asyncio.wait_for(generate_audit_analysis(scan_id), timeout=350)
             if analysis:
                 await persist_audit_analysis(scan_id, analysis)
                 mode = "AI" if analysis.get("ai_generated") else "fallback"
                 logger.info(f"[AI ANALYSIS] Completed ({mode} mode)")
-            else:
-                logger.warning("[AI ANALYSIS] generate_audit_analysis returned None/empty")
         except Exception as exc:
             logger.exception(f"[AI ANALYSIS] Failed (non-fatal): {exc}")
             try:
@@ -2007,7 +1902,7 @@ def normalize_target(raw: str) -> str:
 app = FastAPI(
     title="Network Audit API",
     description="Automated host discovery, service scanning, credential testing, and vulnerability assessment with CVE enrichment.",
-    version="5.1.0",
+    version="5.2.0",
 )
 
 app.add_middleware(
@@ -2022,7 +1917,6 @@ os.makedirs("data/screenshots", exist_ok=True)
 app.mount("/screenshots", StaticFiles(directory="data/screenshots"), name="screenshots")
 
 
-
 @app.on_event("startup")
 async def startup() -> None:
     async with engine.begin() as conn:
@@ -2031,7 +1925,6 @@ async def startup() -> None:
     logger.info(f"nmap   → {NMAP_PATH}")
     logger.info(f"nuclei → {NUCLEI_PATH}")
     await ensure_mac_vendor_db_loaded()
-    logger.info("ALL hosts receive an EXTREME deep scan (nmap -Pn -sS -sV -A -p- --script full).")
 
 
 def _host_to_dict(h: "Host") -> dict:
@@ -2069,7 +1962,6 @@ def _host_to_dict(h: "Host") -> dict:
         "running_applications": h.running_applications or [],
         "screenshot_path":      h.screenshot_path,
         "evidence":             h.evidence or [],
-
         "services": [
             {
                 "port":     s.port,
@@ -2108,12 +2000,10 @@ async def create_scan(req: ScanRequest, background_tasks: BackgroundTasks):
         norm_target = normalize_target(req.target)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-
     scan_id = str(uuid.uuid4())
     async with AsyncSessionLocal() as session:
         async with session.begin():
             session.add(Scan(id=scan_id, target=norm_target, status="running"))
-
     background_tasks.add_task(run_pipeline, scan_id, norm_target)
     logger.info(f"[API] Scan {scan_id} queued for target={norm_target}")
     return ScanResponse(scan_id=scan_id, status="running", target=norm_target)
@@ -2127,12 +2017,9 @@ async def get_status(scan_id: str):
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     return StatusResponse(
-        scan_id=scan.id,
-        target=scan.target,
-        status=scan.status,
+        scan_id=scan.id, target=scan.target, status=scan.status,
         hosts_found=scan.hosts_found or 0,
-        started_at=scan.started_at,
-        finished_at=scan.finished_at,
+        started_at=scan.started_at, finished_at=scan.finished_at,
     )
 
 
@@ -2143,36 +2030,21 @@ async def get_results(scan_id: str):
         scan = s_res.scalar_one_or_none()
         if not scan:
             raise HTTPException(status_code=404, detail="Scan not found")
-
         if scan.status == "running":
             raise HTTPException(status_code=202, detail="Scan is still running.")
-
         h_res = await session.execute(
-            select(Host)
-            .where(Host.scan_id == scan_id)
-            .options(
-                selectinload(Host.services),
-                selectinload(Host.vulnerabilities),
-            )
+            select(Host).where(Host.scan_id == scan_id)
+            .options(selectinload(Host.services), selectinload(Host.vulnerabilities))
         )
         hosts = h_res.scalars().unique().all()
-
-    all_vulns_flat = [
-        {"severity": v.severity}
-        for h in hosts for v in h.vulnerabilities
-    ]
+    all_vulns_flat = [{"severity": v.severity} for h in hosts for v in h.vulnerabilities]
     health_score = compute_health_score(all_vulns_flat)
-
     return {
-        "scan_id":      scan.id,
-        "target":       scan.target,
-        "status":       scan.status,
-        "fail_reason":  scan.fail_reason,
-        "hosts_found":  scan.hosts_found or 0,
+        "scan_id": scan.id, "target": scan.target, "status": scan.status,
+        "fail_reason": scan.fail_reason, "hosts_found": scan.hosts_found or 0,
         "health_score": health_score,
-        "started_at":   scan.started_at,
-        "finished_at":  scan.finished_at,
-        "hosts":        [_host_to_dict(h) for h in hosts],
+        "started_at": scan.started_at, "finished_at": scan.finished_at,
+        "hosts": [_host_to_dict(h) for h in hosts],
     }
 
 
@@ -2185,35 +2057,21 @@ async def list_scans():
                 selectinload(Scan.hosts).selectinload(Host.services),
                 selectinload(Scan.hosts).selectinload(Host.vulnerabilities)
             )
-            .order_by(Scan.started_at.desc())
-            .limit(1)
+            .order_by(Scan.started_at.desc()).limit(1)
         )
         latest_scan = res.scalar_one_or_none()
-
     if not latest_scan:
         return []
-
     sorted_hosts = sorted(latest_scan.hosts, key=lambda x: ipaddress.IPv4Address(x.ip))
-    all_vulns_flat = [
-        {"severity": v.severity}
-        for h in latest_scan.hosts for v in h.vulnerabilities
-    ]
+    all_vulns_flat = [{"severity": v.severity} for h in latest_scan.hosts for v in h.vulnerabilities]
     health_score = compute_health_score(all_vulns_flat)
-
-    return [
-        {
-            "id":          latest_scan.id,
-            "scan_id":     latest_scan.id,
-            "target":      latest_scan.target,
-            "status":      latest_scan.status,
-            "fail_reason": latest_scan.fail_reason,
-            "hosts_found": latest_scan.hosts_found or 0,
-            "health_score": health_score,
-            "started_at":  latest_scan.started_at,
-            "finished_at": latest_scan.finished_at,
-            "discovered_ips": [_host_to_dict(h) for h in sorted_hosts],
-        }
-    ]
+    return [{
+        "id": latest_scan.id, "scan_id": latest_scan.id, "target": latest_scan.target,
+        "status": latest_scan.status, "fail_reason": latest_scan.fail_reason,
+        "hosts_found": latest_scan.hosts_found or 0, "health_score": health_score,
+        "started_at": latest_scan.started_at, "finished_at": latest_scan.finished_at,
+        "discovered_ips": [_host_to_dict(h) for h in sorted_hosts],
+    }]
 
 
 @app.get("/scan/{scan_id}/analysis")
@@ -2242,11 +2100,7 @@ async def get_scan_report(scan_id: str):
 
 @app.get("/health")
 async def health():
-    return {
-        "status":      "ok",
-        "nmap_path":   NMAP_PATH,
-        "nuclei_path": NUCLEI_PATH,
-    }
+    return {"status": "ok", "nmap_path": NMAP_PATH, "nuclei_path": NUCLEI_PATH}
 
 
 if __name__ == "__main__":
