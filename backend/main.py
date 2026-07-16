@@ -2107,7 +2107,7 @@ async def get_scan_report(scan_id: str):
             headers={"Content-Disposition": f"attachment; filename=audit_report_{scan_id[:8]}.pdf"},
         )
     except Exception as exc:
-        logger.error(f"[PDF] Generation failed for {scan_id}: {exc}")
+        logger.error(f"[PDF] Generation failed for {scan_id}: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"PDF generation error: {exc}")
 
 

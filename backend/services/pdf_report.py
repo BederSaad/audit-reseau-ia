@@ -35,6 +35,147 @@ import logging
 logger = logging.getLogger("PDFReport")
 
 # ═══════════════════════════════════════════════════════════════════════
+#  LLM VULNERABILITY DESCRIPTION FALLBACK
+#  Called synchronously from vuln_impact_block when NVD description is empty.
+# ═══════════════════════════════════════════════════════════════════════
+_vuln_desc_cache: dict = {}   # {vuln_key: description}
+
+def get_vuln_description_sync(name: str, cve_id: str, severity: str, cvss: str) -> str:
+    """
+    Ask the local Ollama LLM for a concise vulnerability description.
+    Falls back to a built-in template if Ollama is unavailable.
+    Result is cached per (name, cve_id) to avoid duplicate calls.
+    """
+    cache_key = f"{cve_id or name}"
+    if cache_key in _vuln_desc_cache:
+        return _vuln_desc_cache[cache_key]
+
+    # Built-in knowledge base for the most common CVEs seen in network scans
+    _KNOWN_DESCRIPTIONS = {
+        "CVE-2010-2729": (
+            "MS10-061 is a critical Print Spooler vulnerability in Windows that allows "
+            "unauthenticated remote code execution via SMB. An attacker can write arbitrary "
+            "files to the Windows directory and execute them as SYSTEM, enabling full host compromise."
+        ),
+        "CVE-2010-2550": (
+            "MS10-054 is an SMB server vulnerability in Windows that can cause a denial-of-service "
+            "condition. A specially crafted SMB request containing a malformed value triggers a "
+            "null-pointer dereference, potentially crashing the target system (BSOD)."
+        ),
+        "CVE-2017-0144": (
+            "EternalBlue / MS17-010 is a critical SMB vulnerability exploited by the WannaCry and "
+            "NotPetya ransomware campaigns. It allows unauthenticated remote code execution as SYSTEM "
+            "on unpatched Windows systems through a buffer overflow in the SMBv1 handler."
+        ),
+        "CVE-2014-0160": (
+            "Heartbleed is a critical OpenSSL vulnerability that allows attackers to read up to 64 KB "
+            "of memory from affected servers per request. Private keys, session tokens, and credentials "
+            "can be extracted without any authentication or trace in server logs."
+        ),
+        "CVE-2011-2523": (
+            "vsftpd 2.3.4 contains a deliberately-introduced backdoor. Sending a username containing "
+            "':)' triggers a root shell on TCP port 6200, granting immediate unauthenticated root "
+            "access to the system."
+        ),
+        "CVE-2007-2447": (
+            "Samba 3.0.x 'username map script' RCE allows unauthenticated remote code execution by "
+            "injecting shell metacharacters into a MS-RPC call. This is the vulnerability used by "
+            "the Metasploit 'usermap_script' module and grants root-level access."
+        ),
+        "CVE-2014-6271": (
+            "Shellshock is a critical bash vulnerability allowing remote code execution via environment "
+            "variables. CGI-based web applications, DHCP clients, and SSH ForceCommand configurations "
+            "are all attack vectors. Exploitation requires no authentication on vulnerable systems."
+        ),
+        "CVE-2007-6750": (
+            "Slowloris is a denial-of-service vulnerability in HTTP servers. By opening many partial "
+            "connections and holding them open with incomplete headers, an attacker can exhaust the "
+            "server's connection pool, rendering it unavailable to legitimate users."
+        ),
+    }
+
+    if cve_id and cve_id in _KNOWN_DESCRIPTIONS:
+        desc = _KNOWN_DESCRIPTIONS[cve_id]
+        _vuln_desc_cache[cache_key] = desc
+        return desc
+
+    # Try Ollama for unknown CVEs
+    try:
+        import httpx, json as _json
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
+        cve_part = f"({cve_id})" if cve_id else ""
+        prompt = (
+            f"You are a cybersecurity expert. Write a concise 2-3 sentence technical description "
+            f"of the vulnerability '{name}' {cve_part} with severity {severity}"
+            + (f" and CVSS score {cvss}" if cvss and cvss != "—" else "")
+            + ". Explain what the vulnerability is, what an attacker can do with it, and what "
+            "systems are affected. Be factual and technical. Do not use markdown."
+        )
+        payload = {
+            "model": ollama_model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.1, "num_ctx": 2048},
+        }
+        resp = httpx.post(f"{ollama_host}/api/generate", json=payload, timeout=15.0)
+        if resp.status_code == 200:
+            desc = resp.json().get("response", "").strip()
+            if desc and len(desc) > 30:
+                _vuln_desc_cache[cache_key] = desc
+                return desc
+    except Exception as e:
+        logger.debug(f"[LLM desc] Ollama unavailable: {e}")
+
+    # Generic intelligent fallback based on vuln name patterns
+    name_lower = name.lower()
+    if "smb" in name_lower or "ms10" in name_lower:
+        desc = (
+            f"{name} is a Windows SMB vulnerability that can be exploited remotely over the network. "
+            "It may allow attackers to execute arbitrary code or cause denial-of-service conditions "
+            "on unpatched systems exposed on SMB ports 139/445."
+        )
+    elif "ssl" in name_lower or "tls" in name_lower or "diffie" in name_lower or "dh" in name_lower:
+        desc = (
+            f"{name} is a cryptographic weakness in the TLS/SSL stack. Weak cipher suites or "
+            "insufficient key sizes allow passive eavesdropping or active man-in-the-middle attacks, "
+            "compromising the confidentiality of encrypted communications."
+        )
+    elif "sql" in name_lower or "injection" in name_lower:
+        desc = (
+            f"{name} is a SQL injection vulnerability that allows attackers to manipulate database "
+            "queries. Successful exploitation can lead to data exfiltration, authentication bypass, "
+            "and in some cases remote code execution through database stored procedures."
+        )
+    elif "xss" in name_lower:
+        desc = (
+            f"{name} is a cross-site scripting vulnerability that allows injection of malicious scripts "
+            "into web pages viewed by other users. This can be used to steal session cookies, "
+            "redirect users, or perform actions on their behalf."
+        )
+    elif "rce" in name_lower or "remote code" in name_lower or "execute" in name_lower:
+        desc = (
+            f"{name} is a remote code execution vulnerability allowing attackers to run arbitrary "
+            "commands on the target system. Depending on the service's privilege level, this can "
+            "result in complete system compromise."
+        )
+    elif "dos" in name_lower or "denial" in name_lower:
+        desc = (
+            f"{name} is a denial-of-service vulnerability that can crash or render the affected "
+            "service unavailable. An attacker sending specially crafted requests can exhaust server "
+            "resources, causing service interruption for legitimate users."
+        )
+    else:
+        desc = (
+            f"{name} is a {severity}-severity security vulnerability identified on this host. "
+            "It was detected by automated scanning and should be evaluated by a security professional "
+            "to assess the precise impact and exploitation risk in this specific environment."
+        )
+
+    _vuln_desc_cache[cache_key] = desc
+    return desc
+
+# ═══════════════════════════════════════════════════════════════════════
 #  COLOUR PALETTE  (unchanged from original)
 # ═══════════════════════════════════════════════════════════════════════
 C = {
@@ -224,6 +365,67 @@ class GradientBar(Flowable):
         c.rect(self.width * 0.6, 0, self.width * 0.4, self.height, fill=1, stroke=0)
 
 
+class DiagonalWeave(Flowable):
+    """Thin diagonal-stripe accent bar — a small futuristic divider motif."""
+    def __init__(self, width=BODY_W, height=10, stripe_color=None, gap=15, line_width=1.4):
+        Flowable.__init__(self)
+        self.width       = width
+        self.height      = height
+        self.color       = stripe_color or C["gold"]
+        self.gap         = gap
+        self.line_width  = line_width
+
+    def wrap(self, aw, ah):
+        return self.width, self.height
+
+    def draw(self):
+        c = self.canv
+        c.saveState()
+        p = c.beginPath()
+        p.moveTo(0, 0)
+        p.lineTo(self.width, 0)
+        p.lineTo(self.width, self.height)
+        p.lineTo(0, self.height)
+        p.close()
+        c.clipPath(p, stroke=0, fill=0)
+        c.setStrokeColor(self.color)
+        c.setLineWidth(self.line_width)
+        x = -self.height
+        while x < self.width + self.height:
+            c.line(x, 0, x + self.height, self.height)
+            x += self.gap
+        c.restoreState()
+
+
+class CornerFacet(Flowable):
+    """A small angled gold facet — used as a decorative corner accent."""
+    def __init__(self, size=60, color=None, corner="tr"):
+        Flowable.__init__(self)
+        self.size  = size
+        self.color = color or C["gold"]
+        self.corner = corner
+
+    def wrap(self, aw, ah):
+        return self.size, self.size
+
+    def draw(self):
+        c = self.canv
+        c.saveState()
+        c.setFillColor(self.color)
+        p = c.beginPath()
+        if self.corner == "tr":
+            p.moveTo(0, self.size)
+            p.lineTo(self.size, self.size)
+            p.lineTo(self.size, 0)
+        else:
+            p.moveTo(0, 0)
+            p.lineTo(self.size, 0)
+            p.lineTo(0, self.size)
+        p.close()
+        c.drawPath(p, fill=1, stroke=0)
+        c.restoreState()
+
+
 class SidebarPara(Flowable):
     """Paragraph with a coloured left border."""
     def __init__(self, para: Paragraph, border_color, bg_color=None, padding=8):
@@ -293,38 +495,57 @@ def host_banner(ip: str, os_name: str, dev_class: str) -> Table:
 # ═══════════════════════════════════════════════════════════════════════
 def metric_cards(metrics: list) -> Table:
     """
-    metrics = [(value, label, color), …]   – renders a row of KPI boxes.
+    metrics = [(value, label, color), …]
+    Renders a row of large KPI cards with dark-blue header band + white body.
     """
-    n     = len(metrics)
-    w     = BODY_W / n
-    cells = []
-    for val, lbl, clr in metrics:
-        num_style = ParagraphStyle(f"mn_{lbl}", fontName="Helvetica-Bold",
-                                   fontSize=28, leading=32,
-                                   textColor=clr, alignment=TA_CENTER)
-        lbl_style = ParagraphStyle(f"ml_{lbl}", fontName="Helvetica",
-                                   fontSize=9, leading=13,
-                                   textColor=C["mid_gray"], alignment=TA_CENTER)
-        cells.append([
-            Paragraph(f"{val}", num_style),
-            Spacer(1, 4),
-            Paragraph(lbl, lbl_style),
-        ])
+    n = len(metrics)
+    w = BODY_W / n
 
-    # Build as a row of inner tables side by side
-    inner = [Table([[c[0]], [c[1]], [c[2]]], colWidths=[w - 2]) for c in cells]
-    outer = Table([inner], colWidths=[w] * n)
-    outer.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0), (-1,-1), C["white"]),
-        ("BOX",           (0,0), (-1,-1), 1.5, C["gold"]),
-        ("INNERGRID",     (0,0), (-1,-1), 0.5, C["grid"]),
-        ("TOPPADDING",    (0,0), (-1,-1), 18),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 18),
-        ("LEFTPADDING",   (0,0), (-1,-1), 8),
-        ("RIGHTPADDING",  (0,0), (-1,-1), 8),
+    header_cells = []
+    value_cells  = []
+
+    for val, lbl, clr in metrics:
+        lbl_s = ParagraphStyle(f"_mkl_{lbl}", fontName="Helvetica-Bold",
+                               fontSize=8, leading=11,
+                               textColor=C["gold"], alignment=TA_CENTER)
+        val_s = ParagraphStyle(f"_mkv_{lbl}", fontName="Helvetica-Bold",
+                               fontSize=26, leading=30,
+                               textColor=clr, alignment=TA_CENTER)
+        header_cells.append(Paragraph(lbl.upper(), lbl_s))
+        value_cells.append(Paragraph(str(val), val_s))
+
+    header_row = Table([header_cells], colWidths=[w] * n)
+    header_row.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), C["dark_blue"]),
+        ("TOPPADDING",    (0,0), (-1,-1), 10),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 10),
+        ("LEFTPADDING",   (0,0), (-1,-1), 4),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 4),
+        ("INNERGRID",     (0,0), (-1,-1), 0.5, C["accent1"]),
         ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
     ]))
-    return outer
+
+    value_row = Table([value_cells], colWidths=[w] * n)
+    value_row.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), C["white"]),
+        ("TOPPADDING",    (0,0), (-1,-1), 18),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 18),
+        ("LEFTPADDING",   (0,0), (-1,-1), 4),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 4),
+        ("INNERGRID",     (0,0), (-1,-1), 0.5, C["grid"]),
+        ("BOX",           (0,0), (-1,-1), 1.5, C["gold"]),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+    ]))
+
+    wrapper = Table([[header_row], [value_row]], colWidths=[BODY_W])
+    wrapper.setStyle(TableStyle([
+        ("BOX",           (0,0), (-1,-1), 2, C["gold"]),
+        ("TOPPADDING",    (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+        ("LEFTPADDING",   (0,0), (-1,-1), 0),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+    ]))
+    return wrapper
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -452,7 +673,7 @@ def build_vuln_chart(all_vulns: list) -> Optional[Image]:
             return None
 
         fig, ax = plt.subplots(figsize=(4, 3), facecolor="none")
-        wedges, texts, autotexts = ax.pie(  # type: ignore[misc]
+        wedges, texts, autotexts = ax.pie( # type: ignore[misc]
             sizes, labels=labels, colors=clrs,
             autopct="%1.0f%%", startangle=140,
             wedgeprops=dict(width=0.55, edgecolor="white", linewidth=2),
@@ -507,22 +728,52 @@ def build_risk_bar_chart(hosts: list) -> Optional[Image]:
 # ═══════════════════════════════════════════════════════════════════════
 #  TERMINAL / NSE EVIDENCE BLOCKS
 # ═══════════════════════════════════════════════════════════════════════
-def build_terminal_snapshot(title: str, cmd: str, output: str, timestamp: str) -> list:
-    """Premium dark terminal block for nmap/nuclei commands."""
+def _strip_command_from_output(output: str) -> str:
+    """
+    Remove the '$ <command>' line(s) from raw command output so only
+    the actual result is displayed in the evidence block.
+    Handles both the short preview line and the full-width wrapped line.
+    """
     lines = output.split("\n")
+    filtered = []
+    skip_next_blank = False
+    for line in lines:
+        stripped = line.strip()
+        # Skip lines that look like shell prompts or command repetitions
+        if (stripped.startswith("$ ") or
+                stripped.startswith("C:\\") or
+                stripped.startswith("c:\\") or
+                (stripped.startswith("[stderr]") and len(stripped) < 80)):
+            skip_next_blank = True
+            continue
+        # Skip the blank line immediately after a command line
+        if skip_next_blank and stripped == "":
+            skip_next_blank = False
+            continue
+        skip_next_blank = False
+        filtered.append(line)
+
+    # Remove leading blank lines
+    while filtered and not filtered[0].strip():
+        filtered.pop(0)
+    return "\n".join(filtered)
+
+
+def build_terminal_snapshot(title: str, cmd: str, output: str, timestamp: str) -> list:
+    """
+    Dark terminal block showing ONLY the command output — no '$ cmd' line.
+    The title bar names the tool/operation; the body shows the result.
+    """
+    # Strip the command invocation — show result only
+    clean_output = _strip_command_from_output(output)
+
+    lines = clean_output.split("\n")
     if len(lines) > 40:
         lines = lines[:40] + [f"... [{len(lines)-40} additional lines truncated]"]
     clean = xml_escape("\n".join(lines))
     clean = clean.replace("\n", "<br/>").replace("  ", "&nbsp;&nbsp;")
 
-    gold_hex  = hex_of(C["term_prompt"])
-    white_hex = hex_of(C["white"])
-    text_hex  = hex_of(C["term_text"])
-
-    prompt_line = (
-        f"<font color='{gold_hex}'><b>$</b></font> "
-        f"<font color='{white_hex}'>{xml_escape(cmd[:160])}</font><br/><br/>"
-    ) if cmd else ""
+    text_hex = hex_of(C["term_text"])
 
     title_s = ParagraphStyle("_tt", fontName="Helvetica-Bold", fontSize=8,
                                textColor=C["gold"])
@@ -539,7 +790,7 @@ def build_terminal_snapshot(title: str, cmd: str, output: str, timestamp: str) -
         ("LEFTPADDING",  (0,0), (-1,-1), 14),
     ]))
     body_row = Table(
-        [[Paragraph(f"<font color='{text_hex}'>{prompt_line}{clean}</font>", body_s)]],
+        [[Paragraph(f"<font color='{text_hex}'>{clean}</font>", body_s)]],
         colWidths=[BODY_W])
     body_row.setStyle(TableStyle([
         ("BACKGROUND",   (0,0), (-1,-1), C["term_bg"]),
@@ -727,56 +978,164 @@ def _page_decorator(canv, doc, scan_target: str, scan_date: str):
 
 # ═══════════════════════════════════════════════════════════════════════
 #  COVER PAGE
+#  Logo: place  intelligent.png  at  C:/Users/<you>/Desktop/intelligent.png
+#  The code also checks  ./intelligent.png  and  ./assets/intelligent.png
+#  so you can copy the file next to main.py if preferred.
 # ═══════════════════════════════════════════════════════════════════════
+LOGO_SEARCH_PATHS = [
+    # backend/intelligent.png  (same level as main.py — where you placed it)
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "intelligent.png"),
+    # backend/services/intelligent.png  (inside services/ as fallback)
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "intelligent.png"),
+    # Desktop fallback
+    os.path.join(os.path.expanduser("~"), "Desktop", "intelligent.png"),
+    os.path.join(os.path.expanduser("~"), "Desktop", "Intelligent.png"),
+    # Current working directory (wherever uvicorn is launched from)
+    "intelligent.png",
+]
+
+def _find_logo() -> Optional[str]:
+    for p in LOGO_SEARCH_PATHS:
+        if os.path.exists(p):
+            return p
+    return None
+
+
 def build_cover(scan, styles: dict) -> list:
-    date_str  = scan.started_at.strftime("%B %d, %Y") if scan.started_at else "N/A"
-    duration  = ""
+    date_str = scan.started_at.strftime("%B %d, %Y") if scan.started_at else "N/A"
+    duration = "N/A"
     if scan.started_at and scan.finished_at:
-        secs = int((scan.finished_at - scan.started_at).total_seconds())
+        secs     = int((scan.finished_at - scan.started_at).total_seconds())
         duration = f"{secs//3600}h {(secs%3600)//60}m {secs%60}s"
 
-    rows = [
-        [Paragraph("NETWORK<br/>SECURITY<br/>AUDIT", styles["cover_title"])],
-        [Spacer(1, 8)],
-        [ThinRule(BODY_W, C["gold"])],
-        [Spacer(1, 12)],
-        [Paragraph("COMPREHENSIVE VULNERABILITY &amp; RISK ASSESSMENT", styles["cover_sub"])],
-        [Spacer(1, 60)],
-        [Paragraph(f"<b>TARGET</b>", ParagraphStyle("_cl", fontName="Helvetica-Bold",
-                    fontSize=9, textColor=C["gold"]))],
-        [Paragraph(scan.target, ParagraphStyle("_cv", fontName="Courier", fontSize=14,
-                    textColor=C["white"]))],
-        [Spacer(1, 16)],
-        [Paragraph(f"<b>REPORT DATE</b>", ParagraphStyle("_cl2", fontName="Helvetica-Bold",
-                    fontSize=9, textColor=C["gold"]))],
-        [Paragraph(date_str, styles["cover_meta"])],
-        [Spacer(1, 16)] if duration else [Spacer(1, 0)],
-    ] + ([
-        [Paragraph("<b>SCAN DURATION</b>", ParagraphStyle("_cl3", fontName="Helvetica-Bold",
-                    fontSize=9, textColor=C["gold"]))],
-        [Paragraph(duration, styles["cover_meta"])],
-        [Spacer(1, 16)],
-    ] if duration else []) + [
-        [Paragraph("CLASSIFICATION: CONFIDENTIAL", styles["cover_class"])],
-    ]
+    logo_path = _find_logo()
+    INNER_W   = BODY_W - 84   # usable width inside the dark cover panel
 
-    heights = [1.8*inch, 0.1*inch, 0.05*inch, 0.1*inch, 0.5*inch, 1.5*inch] + \
-              [0.25*inch, 0.35*inch, 0.2*inch, 0.25*inch, 0.35*inch]
-    if duration:
-        heights += [0.2*inch, 0.25*inch, 0.35*inch, 0.2*inch, 0.25*inch]
+    # ── Top bar: classification tag (left)  +  logo pinned top-right ──
+    tag_style = ParagraphStyle("_covtag", fontName="Helvetica-Bold", fontSize=8.5,
+                                textColor=C["gold"], leading=12, alignment=TA_LEFT)
+    tag_para  = Paragraph(
+        "CONFIDENTIAL &nbsp;/&nbsp; SECURITY AUDIT REPORT", tag_style)
+
+    if logo_path:
+        try:
+            logo_img = Image(logo_path, width=2.0*inch, height=0.58*inch)
+            logo_img.hAlign = "RIGHT"
+            logo_cell = logo_img
+        except Exception as e:
+            logger.warning(f"[PDF] Logo load failed: {e}")
+            logo_cell = Spacer(1, 1)
     else:
-        heights += [0.25*inch]
+        logo_cell = Spacer(1, 1)
 
-    cover = Table(rows, colWidths=[BODY_W])
-    cover.setStyle(TableStyle([
-        ("BACKGROUND",   (0,0), (-1,-1), C["dark_blue"]),
-        ("LEFTPADDING",  (0,0), (-1,-1), 60),
-        ("RIGHTPADDING", (0,0), (-1,-1), 60),
-        ("TOPPADDING",   (0,0), (-1,-1), 0),
-        ("BOTTOMPADDING",(0,0), (-1,-1), 0),
-        ("VALIGN",       (0,0), (-1,-1), "TOP"),
+    header_row = Table([[tag_para, logo_cell]],
+                        colWidths=[INNER_W - 2.1*inch, 2.1*inch])
+    header_row.setStyle(TableStyle([
+        ("VALIGN",        (0,0), (-1,-1), "TOP"),
+        ("ALIGN",         (1,0), (1,0),  "RIGHT"),
+        ("LEFTPADDING",   (0,0), (-1,-1), 0),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+        ("TOPPADDING",    (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 0),
     ]))
-    return [cover, PageBreak()]
+
+    # ── Title block ────────────────────────────────────────────────────
+    title_style = ParagraphStyle("_covtitle2", fontName="Helvetica-Bold", fontSize=42,
+                                  leading=46, textColor=C["gold"])
+    title_para = Paragraph("NETWORK SECURITY<br/>AUDIT", title_style)
+
+    subtitle_style = ParagraphStyle("_covsub2", fontName="Helvetica", fontSize=12.5,
+                                     leading=18, textColor=colors.HexColor("#C9D6E3"))
+    subtitle_para = Paragraph(
+        "COMPREHENSIVE VULNERABILITY &amp; RISK ASSESSMENT", subtitle_style)
+
+    # ── Stat cards (2 × 2) ─────────────────────────────────────────────
+    def stat_card(label, value, width):
+        lbl_p = Paragraph(label, ParagraphStyle(
+            f"_scl_{label}", fontName="Helvetica-Bold", fontSize=8,
+            textColor=C["gold"], leading=11))
+        val_p = Paragraph(xml_escape(str(value)), ParagraphStyle(
+            f"_scv_{label}", fontName="Courier", fontSize=13,
+            textColor=C["white"], leading=17))
+        inner = Table([[lbl_p], [Spacer(1, 5)], [val_p]],
+                      colWidths=[width - 22])
+        inner.setStyle(TableStyle([
+            ("LEFTPADDING", (0,0), (-1,-1), 0),
+            ("TOPPADDING",  (0,0), (-1,-1), 0),
+            ("BOTTOMPADDING",(0,0),(-1,-1), 0),
+        ]))
+        card = Table([[inner]], colWidths=[width])
+        card.setStyle(TableStyle([
+            ("LINEBEFORE",   (0,0), (-1,-1), 2.2, C["gold"]),
+            ("TOPPADDING",   (0,0), (-1,-1), 10),
+            ("BOTTOMPADDING",(0,0), (-1,-1), 14),
+            ("LEFTPADDING",  (0,0), (-1,-1), 14),
+        ]))
+        return card
+
+    half = INNER_W / 2
+    stats_grid = Table([
+        [stat_card("TARGET", scan.target, half), stat_card("REPORT DATE", date_str, half)],
+        [stat_card("SCAN DURATION", duration, half), stat_card("CLASSIFICATION", "CONFIDENTIAL", half)],
+    ], colWidths=[half, half])
+    stats_grid.setStyle(TableStyle([
+        ("VALIGN",        (0,0), (-1,-1), "TOP"),
+        ("TOPPADDING",    (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+        ("LEFTPADDING",   (0,0), (-1,-1), 0),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+    ]))
+
+    disclaimer_style = ParagraphStyle("_covdisc2", fontName="Helvetica-Oblique", fontSize=8,
+                                       leading=11.5, textColor=colors.HexColor("#8FA3B8"))
+    disclaimer_para = Paragraph(
+        "This report was generated automatically by an AI-powered audit engine, based "
+        "on real-time network probing data captured during the assessment window.",
+        disclaimer_style)
+
+    # ── Assemble the full dark cover panel ─────────────────────────────
+    panel_rows = [
+        [Spacer(1, 8)],
+        [header_row],
+        [Spacer(1, 46)],
+        [title_para],
+        [Spacer(1, 8)],
+        [ThinRule(2.4*inch, C["gold"])],
+        [Spacer(1, 12)],
+        [subtitle_para],
+        [Spacer(1, 46)],
+        [DiagonalWeave(INNER_W, 11)],
+        [Spacer(1, 34)],
+        [stats_grid],
+        [Spacer(1, 46)],
+        [disclaimer_para],
+        [Spacer(1, 6)],
+    ]
+    cover_panel = Table(panel_rows, colWidths=[BODY_W])
+    cover_panel.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), C["dark_blue"]),
+        ("LEFTPADDING",   (0,0), (-1,-1), 42),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 42),
+        ("TOPPADDING",    (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+        ("VALIGN",        (0,0), (-1,-1), "TOP"),
+    ]))
+
+    # ── Edge-to-edge techy footer strip (tools used) ───────────────────
+    tools_style = ParagraphStyle("_covtools2", fontName="Helvetica-Bold", fontSize=8.5,
+                                  textColor=C["gold"], leading=13)
+    tools_para = Paragraph(
+        "NMAP&nbsp;7.99 &nbsp;·&nbsp; NUCLEI &nbsp;·&nbsp; AI ANALYSIS ENGINE "
+        "&nbsp;·&nbsp; EVIDENCE CAPTURE MODULE", tools_style)
+    tools_row = Table([[tools_para]], colWidths=[BODY_W])
+    tools_row.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), C["accent2"]),
+        ("TOPPADDING",    (0,0), (-1,-1), 12),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 12),
+        ("LEFTPADDING",   (0,0), (-1,-1), 42),
+    ]))
+
+    return [cover_panel, tools_row, PageBreak()]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -834,9 +1193,21 @@ def vuln_impact_block(v: dict, styles: dict) -> list:
     sev_c = sev_color(sev)
     bg    = sev_badge_bg(sev)
     name  = xml_escape(v.get("name","Unknown Vulnerability"))
-    desc  = xml_escape((v.get("description") or "No description available.")[:500])
     cve   = v.get("cve_id") or "—"
     cvss  = f"{v['cvss_score']:.1f}" if v.get("cvss_score") else "—"
+    raw_desc = v.get("description") or ""
+    # If NVD returned no description or the placeholder string, ask the LLM
+    _nvd_empty = (
+        not raw_desc.strip()
+        or "Aucune description" in raw_desc
+        or "No description available" in raw_desc
+        or len(raw_desc.strip()) < 20
+    )
+    if _nvd_empty:
+        raw_desc = get_vuln_description_sync(
+            v.get("name",""), cve if cve != "—" else "", sev, cvss
+        )
+    desc  = xml_escape(raw_desc[:600])
     rem   = xml_escape((v.get("remediation") or "Apply vendor patch; restrict service access.")[:300])
 
     header_style = ParagraphStyle("_vh", fontName="Helvetica-Bold", fontSize=10,
@@ -948,51 +1319,108 @@ def render_evidence_item(ev: dict, host_ip: str, styles: dict) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  TOC  (simple text-based)
+#  TOC  — styled card-based design
 # ═══════════════════════════════════════════════════════════════════════
 def build_toc(hosts: list, styles: dict) -> list:
+    """
+    Modern, single-page index. Deliberately does NOT enumerate individual
+    hosts (that quick-nav strip was dropped — it was visually noisy and
+    pushed the report onto an extra, half-empty page). Host-level detail
+    still lives in full in §4 Host-by-Host Deep Dive.
+    """
     story = []
-    story.append(section_banner("Table of Contents", "≡"))
-    story.append(Spacer(1, 18))
 
-    sections = [
-        ("1", "Executive Summary", ""),
-        ("2", "Scan Overview & Metrics", ""),
-        ("3", "Discovered Hosts — Network Map", ""),
-        ("4", "Host-by-Host Deep Dive", ""),
-    ]
-    for i, h in enumerate(hosts, 1):
-        sections.append((f"  4.{i}", f"{h['ip']}  —  {h.get('device_classification','Unknown')}", ""))
-    sections += [
-        ("5", "Vulnerability Analysis", ""),
-        ("6", "Strategic Roadmap & Recommendations", ""),
-        ("7", "Conclusion & Sign-Off", ""),
+    # ── Header bar ──────────────────────────────────────────────────────
+    toc_title_s = ParagraphStyle("_toch2", fontName="Helvetica-Bold", fontSize=22,
+                                  textColor=C["gold"], alignment=TA_LEFT)
+    toc_sub_s   = ParagraphStyle("_tochsub2", fontName="Helvetica-Bold", fontSize=9,
+                                  textColor=colors.HexColor("#9FB3C8"), alignment=TA_RIGHT,
+                                  leading=12)
+    toc_header = Table(
+        [[Paragraph("TABLE OF CONTENTS", toc_title_s),
+          Paragraph(f"{len(hosts)} HOST(S)<br/>AUDITED", toc_sub_s)]],
+        colWidths=[BODY_W * 0.72, BODY_W * 0.28])
+    toc_header.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,-1), C["dark_blue"]),
+        ("TOPPADDING",    (0,0), (-1,-1), 22),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 22),
+        ("LEFTPADDING",   (0,0), (-1,-1), 24),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 24),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+        ("ALIGN",         (1,0), (1,0), "RIGHT"),
+    ]))
+    story.append(toc_header)
+    story.append(DiagonalWeave(BODY_W, 8))
+    story.append(Spacer(1, 24))
+
+    # ── Section index ────────────────────────────────────────────────────
+    main_sections = [
+        ("01", "Executive Summary",
+         "High-level overview of findings, key risks, and overall security verdict."),
+        ("02", "Scan Overview & Metrics",
+         "KPI dashboard, vulnerability distribution charts, and scan metadata."),
+        ("03", "Discovered Hosts — Network Map",
+         "Visual inventory of all live devices found on the network."),
+        ("04", "Host-by-Host Deep Dive",
+         "Granular per-asset analysis: ports, vulnerabilities, evidence, remediation."),
+        ("05", "Vulnerability Analysis",
+         "Consolidated registry of all findings across the entire network."),
+        ("06", "Strategic Roadmap & Recommendations",
+         "Prioritised action plan to address identified security gaps."),
+        ("07", "Conclusion & Sign-Off",
+         "Final verdict, likelihood of compromise assessment, and auditor sign-off."),
     ]
 
-    for num, title, page in sections:
-        bold  = num.strip() and not num.startswith("  ")
-        style = ParagraphStyle(
-            f"_toc{'b' if bold else 's'}",
-            fontName="Helvetica-Bold" if bold else "Helvetica",
-            fontSize=10 if bold else 9,
-            leading=16,
-            textColor=C["dark_blue"] if bold else C["black"],
-            leftIndent=0 if bold else 20,
-        )
-        row = Table(
-            [[Paragraph(f"{num}.", style), Paragraph(title, style)]],
-            colWidths=[0.45*inch, BODY_W - 0.45*inch])
-        row.setStyle(TableStyle([
-            ("TOPPADDING",    (0,0), (-1,-1), 3),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 3),
-            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+    title_s = ParagraphStyle("_tt3", fontName="Helvetica-Bold", fontSize=12.5,
+                              textColor=C["dark_blue"], leading=16)
+    desc_s  = ParagraphStyle("_td3", fontName="Helvetica", fontSize=9.3,
+                              textColor=C["mid_gray"], leading=13)
+    num_dark_s = ParagraphStyle("_tnd", fontName="Helvetica-Bold", fontSize=18,
+                                 textColor=C["white"], alignment=TA_CENTER, leading=22)
+    num_gold_s = ParagraphStyle("_tng", fontName="Helvetica-Bold", fontSize=18,
+                                 textColor=C["dark_blue"], alignment=TA_CENTER, leading=22)
+
+    NUM_W = 0.62 * inch
+    for i, (num, title, desc) in enumerate(main_sections):
+        chip_style, chip_bg = (num_gold_s, C["gold"]) if i % 2 else (num_dark_s, C["dark_blue"])
+        chip = Table([[Paragraph(num, chip_style)]], colWidths=[NUM_W], rowHeights=[NUM_W])
+        chip.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,-1), chip_bg),
+            ("VALIGN",     (0,0), (-1,-1), "MIDDLE"),
+            ("ALIGN",      (0,0), (-1,-1), "CENTER"),
         ]))
-        if bold:
-            story.append(Spacer(1, 4))
-        story.append(row)
-        if bold:
-            story.append(ThinRule(BODY_W, C["grid"]))
 
+        text_cell = Table(
+            [[Paragraph(title, title_s)], [Spacer(1, 3)], [Paragraph(desc, desc_s)]],
+            colWidths=[BODY_W - NUM_W - 30])
+        text_cell.setStyle(TableStyle([
+            ("LEFTPADDING",   (0,0), (-1,-1), 0),
+            ("TOPPADDING",    (0,0), (-1,-1), 0),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+        ]))
+
+        row = Table([[chip, text_cell]], colWidths=[NUM_W, BODY_W - NUM_W])
+        row.setStyle(TableStyle([
+            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+            ("LEFTPADDING",   (1,0), (1,0), 18),
+            ("LEFTPADDING",   (0,0), (0,0), 0),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 0),
+            ("TOPPADDING",    (0,0), (-1,-1), 13),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 13),
+            ("LINEBELOW",     (0,0), (-1,-1), 0.6,
+             C["grid"] if i < len(main_sections) - 1 else colors.transparent),
+        ]))
+        story.append(row)
+
+    story.append(Spacer(1, 22))
+    story.append(ThinRule(BODY_W, C["gold"]))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(
+        "Every discovered host receives a full dedicated write-up inside "
+        "§ 04 — Host-by-Host Deep Dive, including open ports, vulnerabilities, "
+        "forensic evidence, and targeted remediation guidance.",
+        ParagraphStyle("_tocfoot", fontName="Helvetica-Oblique", fontSize=8.5,
+                        textColor=C["mid_gray"], leading=12)))
     story.append(PageBreak())
     return story
 
@@ -1157,7 +1585,7 @@ async def generate_pdf_report(scan_id: str) -> bytes:
     ]))
     story.append(Spacer(1, 24))
 
-    # Charts side by side
+    # Charts inside a framed analytics panel
     donut = build_vuln_chart(all_vulns)
     bars  = build_risk_bar_chart(hosts)
     if donut or bars:
@@ -1171,13 +1599,30 @@ async def generate_pdf_report(scan_id: str) -> bytes:
             chart_widths.append(BODY_W / 2)
         if len(chart_cells) == 1:
             chart_widths = [BODY_W]
-        chart_row = Table([chart_cells], colWidths=chart_widths)
-        chart_row.setStyle(TableStyle([
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
+        chart_inner = Table([chart_cells], colWidths=chart_widths)
+        chart_inner.setStyle(TableStyle([
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
             ("ALIGN",  (0,0), (-1,-1), "CENTER"),
         ]))
-        story.append(chart_row)
-        story.append(Spacer(1, 8))
+        panel_lbl = ParagraphStyle("_clbl", fontName="Helvetica-Bold", fontSize=9,
+                                    textColor=C["gold"])
+        chart_panel = Table(
+            [[Paragraph("▸ VISUAL ANALYTICS", panel_lbl)],
+             [chart_inner]],
+            colWidths=[BODY_W])
+        chart_panel.setStyle(TableStyle([
+            ("BACKGROUND",   (0,0), (-1,0), C["dark_blue"]),
+            ("BACKGROUND",   (0,1), (-1,1), C["white"]),
+            ("BOX",          (0,0), (-1,-1), 1.5, C["gold"]),
+            ("TOPPADDING",   (0,0), (-1,0), 8),
+            ("BOTTOMPADDING",(0,0), (-1,0), 8),
+            ("LEFTPADDING",  (0,0), (-1,-1), 12),
+            ("RIGHTPADDING", (0,0), (-1,-1), 12),
+            ("TOPPADDING",   (0,1), (-1,1), 28),
+            ("BOTTOMPADDING",(0,1), (-1,1), 28),
+        ]))
+        story.append(chart_panel)
+        story.append(Spacer(1, 14))
 
     # Scan metadata table
     dur_str = "N/A"
