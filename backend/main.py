@@ -51,7 +51,8 @@ from services.evidence_capture import (
     capture_host_screenshot,
     capture_auth_screenshot,
     capture_credential_text,
-    build_command_evidence,          # NEW — real command evidence builder
+    build_command_evidence,
+    pick_valuable_nse_evidence,        # ← NEW
 )
 
 # =============================================================================
@@ -1329,6 +1330,12 @@ async def service_scan_host(ip: str, arp_snapshot: dict[str, str] | None = None,
                     label=f"Ultimate Nmap Scan exécuté sur {ip} ({len(result.get('services', []))} ports ouverts)",
                 )
                 result.setdefault("evidence", []).append(nmap_evidence)
+
+                # Extract only high-value NSE script outputs (VULNERABLE blocks, service info …)
+                valuable_nse = pick_valuable_nse_evidence(result.get("hostscripts", {}), max_items=2)
+                for nse_ev in valuable_nse:
+                    nse_ev["ip"] = ip
+                    result.setdefault("evidence", []).append(nse_ev)
                 
                 duration = asyncio.get_event_loop().time() - t0
                 logger.info(f"[HEAVY SCAN] {ip} — {len(result['services'])} ports open, OS: {result['os']} — {duration:.1f}s")
@@ -1405,6 +1412,12 @@ async def basic_scan_host(ip: str, arp_snapshot: dict[str, str] | None = None,
                     label=f"Scan Nmap basique (fallback) exécuté sur {ip} ({len(result.get('services', []))} ports ouverts détectés)",
                 )
                 result.setdefault("evidence", []).append(nmap_evidence)
+
+                # Extract only high-value NSE script outputs (VULNERABLE blocks, service info …)
+                valuable_nse = pick_valuable_nse_evidence(result.get("hostscripts", {}), max_items=2)
+                for nse_ev in valuable_nse:
+                    nse_ev["ip"] = ip
+                    result.setdefault("evidence", []).append(nse_ev)
                 
                 duration = asyncio.get_event_loop().time() - t0
                 logger.info(
