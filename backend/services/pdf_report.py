@@ -116,9 +116,10 @@ def get_vuln_description_sync(name: str, cve_id: str, severity: str, cvss: str) 
             "model": ollama_model,
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": 0.1, "num_ctx": 2048},
+            "options": {"temperature": 0.1, "num_ctx": 512, "num_predict": 150},
         }
-        resp = httpx.post(f"{ollama_host}/api/generate", json=payload, timeout=15.0)
+        _to = httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
+        resp = httpx.post(f"{ollama_host}/api/generate", json=payload, timeout=_to)
         if resp.status_code == 200:
             desc = resp.json().get("response", "").strip()
             if desc and len(desc) > 30:
@@ -174,6 +175,91 @@ def get_vuln_description_sync(name: str, cve_id: str, severity: str, cvss: str) 
 
     _vuln_desc_cache[cache_key] = desc
     return desc
+
+
+_vuln_rem_cache: dict = {}   # {vuln_key: remediation}
+
+def get_remediation_sync(name: str, cve_id: str, severity: str, cvss: str) -> str:
+    """
+    Ask the local Ollama LLM for specific, actionable remediation steps.
+    Falls back to pattern-based guidance only when Ollama is unreachable.
+    Cached per (name, cve_id) to avoid duplicate calls.
+    """
+    cache_key = f"rem:{cve_id or name}"
+    if cache_key in _vuln_rem_cache:
+        return _vuln_rem_cache[cache_key]
+
+    try:
+        import httpx
+        ollama_host  = os.getenv("OLLAMA_HOST",  "http://localhost:11434")
+        ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
+        cve_part = f"({cve_id})" if cve_id else ""
+        prompt = (
+            f"You are a senior cybersecurity engineer writing a professional security audit report. "
+            f"Provide 3 to 4 concise, specific, actionable remediation steps for the vulnerability "
+            f"'{name}' {cve_part} (severity: {severity}"
+            + (f", CVSS: {cvss}" if cvss and cvss != "—" else "")
+            + "). Each step should be on its own line starting with a dash (-). "
+            "Be specific — include patch names, commands, or configuration changes where applicable. "
+            "Do NOT use markdown bold or headers. Do not repeat the vulnerability name."
+        )
+        payload = {
+            "model": ollama_model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.1, "num_ctx": 512, "num_predict": 200},
+        }
+        _to = httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
+        resp = httpx.post(f"{ollama_host}/api/generate", json=payload, timeout=_to)
+        if resp.status_code == 200:
+            text = resp.json().get("response", "").strip()
+            if text and len(text) > 30:
+                _vuln_rem_cache[cache_key] = text
+                return text
+    except Exception as e:
+        logger.debug(f"[LLM rem] Ollama unavailable: {e}")
+
+    # Pattern-based fallback (used ONLY if Ollama is down)
+    name_lower = name.lower()
+    if "smb" in name_lower or "ms17" in name_lower or "eternalblue" in name_lower:
+        rem = ("- Apply Microsoft security patch MS17-010 immediately.\n"
+               "- Disable SMBv1 via PowerShell: Set-SmbServerConfiguration -EnableSMB1Protocol $false.\n"
+               "- Block TCP ports 139 and 445 at the perimeter firewall for untrusted networks.\n"
+               "- Isolate unpatched hosts in a quarantine VLAN until patched.")
+    elif "ssl" in name_lower or "tls" in name_lower or "diffie" in name_lower:
+        rem = ("- Disable weak cipher suites and SSLv3/TLSv1.0/1.1 in the server configuration.\n"
+               "- Enforce TLS 1.2+ with forward-secrecy cipher suites (ECDHE-RSA-AES256-GCM-SHA384).\n"
+               "- Regenerate DH parameters with at least 2048-bit key size (openssl dhparam -out dhparam.pem 2048).\n"
+               "- Run SSLLabs scan post-fix to validate the configuration.")
+    elif "ftp" in name_lower or "vsftpd" in name_lower or "backdoor" in name_lower:
+        rem = ("- Immediately shut down the FTP service and quarantine the host.\n"
+               "- Reinstall the service from a trusted source; vsftpd 2.3.4 must be replaced.\n"
+               "- Replace FTP with SFTP (SSH File Transfer Protocol) for all file transfers.\n"
+               "- Audit the host for signs of compromise before returning to production.")
+    elif "sql" in name_lower or "injection" in name_lower:
+        rem = ("- Use parameterised queries / prepared statements in all database-facing code.\n"
+               "- Deploy a Web Application Firewall (WAF) with SQL injection ruleset enabled.\n"
+               "- Restrict database user privileges to the minimum required (least privilege).\n"
+               "- Run automated DAST scans (e.g. OWASP ZAP) against the application after patching.")
+    elif "rce" in name_lower or "remote code" in name_lower:
+        rem = ("- Apply the vendor-issued security patch for this RCE vulnerability immediately.\n"
+               "- If no patch is available, disable or isolate the vulnerable service.\n"
+               "- Deploy exploit mitigation controls (ASLR, DEP/NX, stack canaries) on the host.\n"
+               "- Monitor for exploitation indicators via EDR / SIEM alerting on the affected service.")
+    elif "dos" in name_lower or "denial" in name_lower:
+        rem = ("- Apply the vendor patch that corrects the malformed-request handling.\n"
+               "- Deploy rate-limiting and connection throttling at the load balancer / firewall.\n"
+               "- Enable SYN-cookie protection on the OS level.\n"
+               "- Set up alerting on abnormal connection-count spikes to detect future DoS attempts.")
+    else:
+        rem = ("- Apply the latest vendor security patch for this vulnerability without delay.\n"
+               "- Restrict network access to the affected service to authorised IP ranges only.\n"
+               "- Review and harden the service configuration following CIS Benchmarks.\n"
+               "- Re-scan the host after patching to confirm the finding is resolved.")
+
+    _vuln_rem_cache[cache_key] = rem
+    return rem
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  COLOUR PALETTE  (unchanged from original)
@@ -730,20 +816,32 @@ def build_risk_bar_chart(hosts: list) -> Optional[Image]:
 # ═══════════════════════════════════════════════════════════════════════
 def _strip_command_from_output(output: str) -> str:
     """
-    Remove the '$ <command>' line(s) from raw command output so only
-    the actual result is displayed in the evidence block.
-    Handles both the short preview line and the full-width wrapped line.
+    Remove shell command lines from raw output so only the actual result
+    is displayed in the evidence block.
+    Strips: $ cmd, nmap ..., ncat ..., python ..., C:\\..., [stderr], etc.
     """
+    # Common CLI tools that produce 'command line' entries we want to hide
+    _CMD_PREFIXES = (
+        "$ ", "# ",
+        "nmap ", "ncat ", "nc ", "python ", "python3 ",
+        "curl ", "wget ", "ssh ", "ftp ", "telnet ",
+        "sudo ", "cmd /c", "powershell",
+    )
+    _CMD_STARTS = ("C:\\", "c:\\", "D:\\", "/usr/", "/bin/", "/home/")
     lines = output.split("\n")
     filtered = []
     skip_next_blank = False
     for line in lines:
         stripped = line.strip()
-        # Skip lines that look like shell prompts or command repetitions
-        if (stripped.startswith("$ ") or
-                stripped.startswith("C:\\") or
-                stripped.startswith("c:\\") or
-                (stripped.startswith("[stderr]") and len(stripped) < 80)):
+        # Skip lines that look like shell prompts / tool invocations
+        is_cmd = (
+            any(stripped.startswith(p) for p in _CMD_PREFIXES)
+            or any(stripped.startswith(p) for p in _CMD_STARTS)
+            or (stripped.startswith("[stderr]") and len(stripped) < 100)
+            or (stripped.startswith("Starting Nmap"))   # nmap banner
+            or (stripped.startswith("Nmap scan report"))  # nmap host header
+        )
+        if is_cmd:
             skip_next_blank = True
             continue
         # Skip the blank line immediately after a command line
@@ -763,21 +861,19 @@ def build_terminal_snapshot(title: str, cmd: str, output: str, timestamp: str) -
     """
     Dark terminal block showing ONLY the command output — no '$ cmd' line.
     The title bar names the tool/operation; the body shows the result.
+    Uses a multi-row table so ReportLab can split it across pages if needed.
     """
-    # Strip the command invocation — show result only
     clean_output = _strip_command_from_output(output)
 
     lines = clean_output.split("\n")
-    if len(lines) > 40:
-        lines = lines[:40] + [f"... [{len(lines)-40} additional lines truncated]"]
-    clean = xml_escape("\n".join(lines))
-    clean = clean.replace("\n", "<br/>").replace("  ", "&nbsp;&nbsp;")
+    if len(lines) > 30:
+        lines = lines[:30] + [f"... [{len(lines)-30} additional lines truncated]"]
 
     text_hex = hex_of(C["term_text"])
 
     title_s = ParagraphStyle("_tt", fontName="Helvetica-Bold", fontSize=8,
                                textColor=C["gold"])
-    body_s  = ParagraphStyle("_tb", fontName="Courier", fontSize=7.5, leading=11,
+    body_s  = ParagraphStyle("_tb", fontName="Courier", fontSize=7.5, leading=10,
                                textColor=C["term_text"])
 
     title_row = Table(
@@ -789,13 +885,17 @@ def build_terminal_snapshot(title: str, cmd: str, output: str, timestamp: str) -
         ("BOTTOMPADDING",(0,0), (-1,-1), 7),
         ("LEFTPADDING",  (0,0), (-1,-1), 14),
     ]))
-    body_row = Table(
-        [[Paragraph(f"<font color='{text_hex}'>{clean}</font>", body_s)]],
-        colWidths=[BODY_W])
+
+    cell_rows = []
+    for l in lines:
+        cleaned_l = xml_escape(l).replace(" ", "&nbsp;&nbsp;")
+        cell_rows.append([Paragraph(f"<font color='{text_hex}'>{cleaned_l}</font>", body_s)])
+
+    body_row = Table(cell_rows, colWidths=[BODY_W])
     body_row.setStyle(TableStyle([
         ("BACKGROUND",   (0,0), (-1,-1), C["term_bg"]),
-        ("TOPPADDING",   (0,0), (-1,-1), 12),
-        ("BOTTOMPADDING",(0,0), (-1,-1), 12),
+        ("TOPPADDING",   (0,0), (-1,-1), 2),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 2),
         ("LEFTPADDING",  (0,0), (-1,-1), 14),
         ("RIGHTPADDING", (0,0), (-1,-1), 14),
         ("BOX",          (0,0), (-1,-1), 0.8, colors.HexColor("#2A2A2A")),
@@ -807,19 +907,15 @@ def build_nse_evidence_block(script_id: str, output: str) -> list:
     """
     Dark terminal block for raw Nmap NSE script output.
     Faithfully preserves the | pipe formatting used by nmap.
+    Uses a multi-row table so ReportLab can split it across pages if needed.
     """
     lines = output.split("\n")
-    if len(lines) > 50:
-        lines = lines[:50] + [f"... [{len(lines)-50} additional lines truncated]"]
-    # Escape and preserve spacing
-    formatted = "<br/>".join(
-        xml_escape(l).replace(" ", "&nbsp;") for l in lines
-    )
+    if len(lines) > 30:
+        lines = lines[:30] + [f"... [{len(lines)-30} additional lines truncated]"]
 
-    gold_hex = hex_of(C["gold"])
     title_s  = ParagraphStyle("_nt", fontName="Helvetica-Bold", fontSize=8.5,
                                textColor=C["gold"])
-    body_s   = ParagraphStyle("_nb", fontName="Courier", fontSize=8, leading=11.5,
+    body_s   = ParagraphStyle("_nb", fontName="Courier", fontSize=8, leading=11,
                                textColor=C["term_text"])
 
     title_row = Table(
@@ -831,18 +927,23 @@ def build_nse_evidence_block(script_id: str, output: str) -> list:
         ("BOTTOMPADDING",(0,0), (-1,-1), 8),
         ("LEFTPADDING",  (0,0), (-1,-1), 14),
     ]))
-    body_row = Table(
-        [[Paragraph(formatted, body_s)]],
-        colWidths=[BODY_W])
+
+    cell_rows = []
+    for l in lines:
+        cleaned_l = xml_escape(l).replace(" ", "&nbsp;")
+        cell_rows.append([Paragraph(cleaned_l, body_s)])
+
+    body_row = Table(cell_rows, colWidths=[BODY_W])
     body_row.setStyle(TableStyle([
         ("BACKGROUND",   (0,0), (-1,-1), C["term_bg"]),
-        ("TOPPADDING",   (0,0), (-1,-1), 12),
-        ("BOTTOMPADDING",(0,0), (-1,-1), 12),
+        ("TOPPADDING",   (0,0), (-1,-1), 2),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 2),
         ("LEFTPADDING",  (0,0), (-1,-1), 14),
         ("RIGHTPADDING", (0,0), (-1,-1), 14),
         ("BOX",          (0,0), (-1,-1), 1.5, C["dark_blue"]),
     ]))
     return [title_row, body_row]
+
 
 
 def build_credential_evidence_block(ev: dict) -> list:
@@ -1192,23 +1293,45 @@ def vuln_impact_block(v: dict, styles: dict) -> list:
     sev   = v.get("severity","info")
     sev_c = sev_color(sev)
     bg    = sev_badge_bg(sev)
-    name  = xml_escape(v.get("name","Unknown Vulnerability"))
+    raw_name = v.get("name", "Unknown Vulnerability") or "Unknown Vulnerability"
+    # Clean up non-breaking spaces and truncate to prevent LayoutError
+    raw_name = raw_name.replace("\xa0", " ").split("\n")[0].strip()
+    if len(raw_name) > 120:
+        raw_name = raw_name[:117] + "..."
+    name  = xml_escape(raw_name)
     cve   = v.get("cve_id") or "—"
     cvss  = f"{v['cvss_score']:.1f}" if v.get("cvss_score") else "—"
     raw_desc = v.get("description") or ""
-    # If NVD returned no description or the placeholder string, ask the LLM
+    # If NVD returned no description or a French/English placeholder, ask the LLM
+    _EMPTY_PHRASES = (
+        "Aucune description",          # French: "No description"
+        "disponible",                  # French: "available"
+        "No description available",
+        "No description",
+        "N/A",
+        "via l",                       # fragment of French API message
+        "NVD pour",                    # another French fragment
+    )
     _nvd_empty = (
         not raw_desc.strip()
-        or "Aucune description" in raw_desc
-        or "No description available" in raw_desc
-        or len(raw_desc.strip()) < 20
+        or len(raw_desc.strip()) < 30
+        or any(phrase in raw_desc for phrase in _EMPTY_PHRASES)
     )
     if _nvd_empty:
         raw_desc = get_vuln_description_sync(
             v.get("name",""), cve if cve != "—" else "", sev, cvss
         )
     desc  = xml_escape(raw_desc[:600])
-    rem   = xml_escape((v.get("remediation") or "Apply vendor patch; restrict service access.")[:300])
+
+    # Remediation: use stored value, else ask the LLM
+    raw_rem = v.get("remediation") or ""
+    if not raw_rem.strip() or len(raw_rem.strip()) < 15:
+        raw_rem = get_remediation_sync(
+            v.get("name", ""), cve if cve != "—" else "", sev, cvss
+        )
+    rem_lines = [l.strip().lstrip("-").strip()
+                 for l in raw_rem.split("\n") if l.strip()]
+    rem_html  = "<br/>".join(f"→ {xml_escape(l)}" for l in rem_lines[:5])
 
     header_style = ParagraphStyle("_vh", fontName="Helvetica-Bold", fontSize=10,
                                    textColor=C["white"])
@@ -1222,14 +1345,21 @@ def vuln_impact_block(v: dict, styles: dict) -> list:
         ("LEFTPADDING",  (0,0), (-1,-1), 12),
     ]))
 
-    meta_parts = [f"CVE: <b>{cve}</b>", f"CVSS: <b>{cvss}</b>",
-                  f"Source: <b>{v.get('source','nuclei')}</b>"]
-    meta_style = ParagraphStyle("_vm", fontName="Courier", fontSize=8,
-                                 textColor=C["dark_blue"])
+    # ── Meta row: 3 bounded columns so long CPE/URL identifiers can't overflow ──
+    meta_s = ParagraphStyle("_vm", fontName="Courier", fontSize=8,
+                             textColor=C["dark_blue"], leading=11)
+
+    meta_parts = [
+        f"CVE: <b>{xml_escape(str(v.get('cve_id') or 'N/A'))}</b>",
+        f"CVSS: <b>{xml_escape(cvss)}</b>",
+        f"Source: <b>{xml_escape(v.get('source','nuclei') or 'nuclei')}</b>",
+    ]
+    meta_row = "&nbsp;&nbsp;|&nbsp;&nbsp;".join(f"  {p}  " for p in meta_parts)
+
     body = Table(
         [[Paragraph(f"<b>Impact:</b> {desc}", styles["body"])],
-         [Paragraph("&nbsp;".join(f" {p} " for p in meta_parts), meta_style)],
-         [Paragraph(f"<b>Fix:</b> {rem}", styles["body"])],
+         [Paragraph(meta_row, meta_s)],
+         [Paragraph(f"<b>Remediation:</b><br/>{rem_html}", styles["body"])],
         ], colWidths=[BODY_W])
     body.setStyle(TableStyle([
         ("BACKGROUND",   (0,0), (-1,-1), bg),
@@ -1243,6 +1373,7 @@ def vuln_impact_block(v: dict, styles: dict) -> list:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 #  EVIDENCE SELECTOR
 #  Picks 1-2 high-value evidence items per host (NSE > cmd > text > web)
 # ═══════════════════════════════════════════════════════════════════════
@@ -1251,17 +1382,17 @@ def pick_best_evidence(evidence_items: list, max_items: int = 2) -> list:
     Priority order: nse_script with VULNERABLE keyword > auth_screenshot
     > nse_script (any) > text > command > web_screenshot
     """
-    nse_vuln  = [e for e in evidence_items if e.get("type")=="nse_script"
+    nse_vuln  = [e for e in evidence_items if e.get("type") == "nse_script"
                  and "VULNERABLE" in (e.get("output") or "")]
-    auth_ss   = [e for e in evidence_items if e.get("type")=="auth_screenshot"]
-    nse_other = [e for e in evidence_items if e.get("type")=="nse_script"
+    auth_ss   = [e for e in evidence_items if e.get("type") == "auth_screenshot"]
+    nse_other = [e for e in evidence_items if e.get("type") == "nse_script"
                  and "VULNERABLE" not in (e.get("output") or "")
                  and (e.get("output") or "").strip()
                  and "false" not in (e.get("output") or "").strip().lower()
                  and "error" not in (e.get("output") or "").strip().lower()[:20]]
-    text_ev   = [e for e in evidence_items if e.get("type")=="text"]
-    cmd_ev    = [e for e in evidence_items if e.get("type")=="command"]
-    web_ss    = [e for e in evidence_items if e.get("type")=="web_screenshot"]
+    text_ev   = [e for e in evidence_items if e.get("type") == "text"]
+    cmd_ev    = [e for e in evidence_items if e.get("type") == "command"]
+    web_ss    = [e for e in evidence_items if e.get("type") == "web_screenshot"]
 
     chosen = []
     for bucket in (nse_vuln, auth_ss, nse_other, text_ev, cmd_ev, web_ss):
@@ -1276,40 +1407,40 @@ def pick_best_evidence(evidence_items: list, max_items: int = 2) -> list:
 
 def render_evidence_item(ev: dict, host_ip: str, styles: dict) -> list:
     elems = []
-    t = ev.get("type","")
+    t = ev.get("type", "")
 
     if t == "nse_script":
-        elems.extend(build_nse_evidence_block(ev.get("script_id","unknown"), ev.get("output","")))
+        elems.extend(build_nse_evidence_block(ev.get("script_id", "unknown"), ev.get("output", "")))
         elems.append(Paragraph(
-            f"Fig: Nmap NSE — {ev.get('script_id','')} on {host_ip}  │  {ev.get('timestamp','')}",
+            f"Fig: Nmap NSE \u2014 {ev.get('script_id', '')} on {host_ip}  \u2502  {ev.get('timestamp', '')}",
             styles["caption"]))
 
     elif t == "command":
         elems.extend(build_terminal_snapshot(
-            "COMMAND EXECUTION", ev.get("cmd",""), ev.get("output",""), ev.get("timestamp","")))
+            "COMMAND EXECUTION", ev.get("cmd", ""), ev.get("output", ""), ev.get("timestamp", "")))
         elems.append(Paragraph(
-            f"Fig: {ev.get('label','')}  │  {ev.get('timestamp','')}", styles["caption"]))
+            f"Fig: {ev.get('label', '')}  \u2502  {ev.get('timestamp', '')}", styles["caption"]))
 
     elif t == "text":
         elems.extend(build_credential_evidence_block(ev))
         elems.append(Paragraph(
-            f"Fig: {ev.get('label','')}  │  {ev.get('timestamp','')}", styles["caption"]))
+            f"Fig: {ev.get('label', '')}  \u2502  {ev.get('timestamp', '')}", styles["caption"]))
 
     elif t in ("web_screenshot", "auth_screenshot"):
-        path = ev.get("path","")
+        path = ev.get("path", "")
         if path and os.path.exists(path):
             try:
-                img = Image(path, width=BODY_W, height=3.6*inch)
+                img = Image(path, width=BODY_W, height=3.6 * inch)
                 img.hAlign = "LEFT"
                 frame = Table([[img]], colWidths=[BODY_W])
                 frame.setStyle(TableStyle([
-                    ("BOX",        (0,0), (-1,-1), 2, C["dark_blue"]),
-                    ("PADDING",    (0,0), (-1,-1), 3),
-                    ("BACKGROUND", (0,0), (-1,-1), C["light_gray"]),
+                    ("BOX",        (0, 0), (-1, -1), 2, C["dark_blue"]),
+                    ("PADDING",    (0, 0), (-1, -1), 3),
+                    ("BACKGROUND", (0, 0), (-1, -1), C["light_gray"]),
                 ]))
                 elems.append(frame)
                 elems.append(Paragraph(
-                    f"Fig: Live capture — {ev.get('label','')}", styles["caption"]))
+                    f"Fig: Live capture \u2014 {ev.get('label', '')}", styles["caption"]))
             except Exception:
                 pass
 
@@ -1318,116 +1449,151 @@ def render_evidence_item(ev: dict, host_ip: str, styles: dict) -> list:
     return elems
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  TOC  — styled card-based design
+#  TABLE OF CONTENTS  – clean single-column list design
 # ═══════════════════════════════════════════════════════════════════════
 def build_toc(hosts: list, styles: dict) -> list:
     """
-    Modern, single-page index. Deliberately does NOT enumerate individual
-    hosts (that quick-nav strip was dropped — it was visually noisy and
-    pushed the report onto an extra, half-empty page). Host-level detail
-    still lives in full in §4 Host-by-Host Deep Dive.
+    Premium single-column TOC: dark navy header banner + numbered rows
+    with a gold left-accent bar, section title, and short description.
     """
+    from reportlab.lib.units import inch
     story = []
 
-    # ── Header bar ──────────────────────────────────────────────────────
-    toc_title_s = ParagraphStyle("_toch2", fontName="Helvetica-Bold", fontSize=22,
-                                  textColor=C["gold"], alignment=TA_LEFT)
-    toc_sub_s   = ParagraphStyle("_tochsub2", fontName="Helvetica-Bold", fontSize=9,
-                                  textColor=colors.HexColor("#9FB3C8"), alignment=TA_RIGHT,
-                                  leading=12)
-    toc_header = Table(
-        [[Paragraph("TABLE OF CONTENTS", toc_title_s),
-          Paragraph(f"{len(hosts)} HOST(S)<br/>AUDITED", toc_sub_s)]],
-        colWidths=[BODY_W * 0.72, BODY_W * 0.28])
-    toc_header.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0), (-1,-1), C["dark_blue"]),
-        ("TOPPADDING",    (0,0), (-1,-1), 22),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 22),
-        ("LEFTPADDING",   (0,0), (-1,-1), 24),
-        ("RIGHTPADDING",  (0,0), (-1,-1), 24),
-        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-        ("ALIGN",         (1,0), (1,0), "RIGHT"),
+    # ── Header banner ───────────────────────────────────────────────────
+    label_s = ParagraphStyle("_toc_lbl",  fontName="Helvetica-Bold", fontSize=8,
+                              textColor=C["gold"],      letterSpacing=3, leading=11)
+    title_s = ParagraphStyle("_toc_ttl",  fontName="Helvetica-Bold", fontSize=32,
+                              textColor=C["white"],     leading=36)
+    sub_s   = ParagraphStyle("_toc_sub",  fontName="Helvetica",      fontSize=10,
+                              textColor=colors.HexColor("#8FA3B8"), leading=14)
+
+    host_count_s = ParagraphStyle("_toc_hc",  fontName="Helvetica-Bold", fontSize=38,
+                                   textColor=C["gold"], alignment=TA_RIGHT, leading=42)
+    host_lbl_s   = ParagraphStyle("_toc_hl",  fontName="Helvetica",       fontSize=8,
+                                   textColor=colors.HexColor("#8FA3B8"),
+                                   alignment=TA_RIGHT, leading=11)
+
+    count_block = Table(
+        [[Paragraph(str(len(hosts)), host_count_s)],
+         [Paragraph("HOSTS AUDITED", host_lbl_s)]],
+        colWidths=[1.6*inch])
+    count_block.setStyle(TableStyle([
+        ("LEFTPADDING",  (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (-1,-1), 0),
+        ("TOPPADDING",   (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 0),
     ]))
-    story.append(toc_header)
-    story.append(DiagonalWeave(BODY_W, 8))
+
+    text_block = Table(
+        [[Paragraph("DOCUMENT INDEX", label_s)],
+         [Spacer(1, 8)],
+         [Paragraph("Table of Contents", title_s)],
+         [Spacer(1, 6)],
+         [Paragraph("Network Security Audit Report — Comprehensive Findings", sub_s)]],
+        colWidths=[BODY_W - 1.8*inch])
+    text_block.setStyle(TableStyle([
+        ("LEFTPADDING",  (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (-1,-1), 0),
+        ("TOPPADDING",   (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 0),
+    ]))
+
+    header_inner = Table(
+        [[text_block, count_block]],
+        colWidths=[BODY_W - 1.8*inch, 1.8*inch])
+    header_inner.setStyle(TableStyle([
+        ("VALIGN",       (0,0), (-1,-1), "BOTTOM"),
+        ("LEFTPADDING",  (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (-1,-1), 0),
+        ("TOPPADDING",   (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 0),
+    ]))
+
+    header_outer = Table([[header_inner]], colWidths=[BODY_W])
+    header_outer.setStyle(TableStyle([
+        ("BACKGROUND",   (0,0), (-1,-1), C["dark_blue"]),
+        ("TOPPADDING",   (0,0), (-1,-1), 32),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 32),
+        ("LEFTPADDING",  (0,0), (-1,-1), 32),
+        ("RIGHTPADDING", (0,0), (-1,-1), 32),
+    ]))
+    story.append(header_outer)
+
+    # Gold accent divider
+    story.append(HRFlowable(width=BODY_W, thickness=3, color=C["gold"],
+                             spaceAfter=0, spaceBefore=0))
     story.append(Spacer(1, 24))
 
-    # ── Section index ────────────────────────────────────────────────────
-    main_sections = [
+    # ── Section rows (single-column numbered list) ───────────────────────
+    sections = [
         ("01", "Executive Summary",
-         "High-level overview of findings, key risks, and overall security verdict."),
+         "High-level findings overview, key risk indicators, and overall security posture verdict."),
         ("02", "Scan Overview & Metrics",
-         "KPI dashboard, vulnerability distribution charts, and scan metadata."),
+         "KPI dashboard with charts, scan parameters, and discovery metadata."),
         ("03", "Discovered Hosts — Network Map",
-         "Visual inventory of all live devices found on the network."),
+         "Visual inventory of all live and inactive devices detected on the network."),
         ("04", "Host-by-Host Deep Dive",
-         "Granular per-asset analysis: ports, vulnerabilities, evidence, remediation."),
+         "Per-asset analysis: open ports, confirmed vulnerabilities, forensic evidence, and remediation."),
         ("05", "Vulnerability Analysis",
-         "Consolidated registry of all findings across the entire network."),
+         "Consolidated registry of all findings across the entire target range."),
         ("06", "Strategic Roadmap & Recommendations",
-         "Prioritised action plan to address identified security gaps."),
-        ("07", "Conclusion & Sign-Off",
-         "Final verdict, likelihood of compromise assessment, and auditor sign-off."),
+         "Prioritised action plan, patch timelines, and architectural hardening steps."),
+        ("07", "Conclusion & Auditor Sign-Off",
+         "Final security verdict, compromise likelihood, and formal sign-off."),
     ]
 
-    title_s = ParagraphStyle("_tt3", fontName="Helvetica-Bold", fontSize=12.5,
+    num_s   = ParagraphStyle("_toc_num",  fontName="Helvetica-Bold", fontSize=22,
+                              textColor=C["gold"],      leading=26, alignment=TA_LEFT)
+    sec_s   = ParagraphStyle("_toc_sec",  fontName="Helvetica-Bold", fontSize=11.5,
                               textColor=C["dark_blue"], leading=16)
-    desc_s  = ParagraphStyle("_td3", fontName="Helvetica", fontSize=9.3,
-                              textColor=C["mid_gray"], leading=13)
-    num_dark_s = ParagraphStyle("_tnd", fontName="Helvetica-Bold", fontSize=18,
-                                 textColor=C["white"], alignment=TA_CENTER, leading=22)
-    num_gold_s = ParagraphStyle("_tng", fontName="Helvetica-Bold", fontSize=18,
-                                 textColor=C["dark_blue"], alignment=TA_CENTER, leading=22)
+    dsc_s   = ParagraphStyle("_toc_dsc",  fontName="Helvetica",      fontSize=9,
+                              textColor=C["mid_gray"],  leading=13)
 
-    NUM_W = 0.62 * inch
-    for i, (num, title, desc) in enumerate(main_sections):
-        chip_style, chip_bg = (num_gold_s, C["gold"]) if i % 2 else (num_dark_s, C["dark_blue"])
-        chip = Table([[Paragraph(num, chip_style)]], colWidths=[NUM_W], rowHeights=[NUM_W])
-        chip.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,-1), chip_bg),
-            ("VALIGN",     (0,0), (-1,-1), "MIDDLE"),
-            ("ALIGN",      (0,0), (-1,-1), "CENTER"),
+    ROW_PAD = 14
+    for i, (num, title, desc) in enumerate(sections):
+        row_bg = C["light_gray"] if i % 2 == 0 else C["white"]
+
+        inner = Table(
+            [[Paragraph(num, num_s),
+              Table([[Paragraph(title, sec_s)],
+                     [Spacer(1, 3)],
+                     [Paragraph(desc, dsc_s)]],
+                    colWidths=[BODY_W - 2*ROW_PAD - 60])]],
+            colWidths=[60, BODY_W - 2*ROW_PAD - 60])
+        inner.setStyle(TableStyle([
+            ("VALIGN",       (0,0), (-1,-1), "MIDDLE"),
+            ("LEFTPADDING",  (0,0), (-1,-1), 0),
+            ("RIGHTPADDING", (0,0), (-1,-1), 0),
+            ("TOPPADDING",   (0,0), (-1,-1), 0),
+            ("BOTTOMPADDING",(0,0), (-1,-1), 0),
         ]))
 
-        text_cell = Table(
-            [[Paragraph(title, title_s)], [Spacer(1, 3)], [Paragraph(desc, desc_s)]],
-            colWidths=[BODY_W - NUM_W - 30])
-        text_cell.setStyle(TableStyle([
-            ("LEFTPADDING",   (0,0), (-1,-1), 0),
-            ("TOPPADDING",    (0,0), (-1,-1), 0),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 0),
-        ]))
-
-        row = Table([[chip, text_cell]], colWidths=[NUM_W, BODY_W - NUM_W])
+        row = Table([[inner]], colWidths=[BODY_W])
         row.setStyle(TableStyle([
-            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-            ("LEFTPADDING",   (1,0), (1,0), 18),
-            ("LEFTPADDING",   (0,0), (0,0), 0),
-            ("RIGHTPADDING",  (0,0), (-1,-1), 0),
-            ("TOPPADDING",    (0,0), (-1,-1), 13),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 13),
-            ("LINEBELOW",     (0,0), (-1,-1), 0.6,
-             C["grid"] if i < len(main_sections) - 1 else colors.transparent),
+            ("BACKGROUND",   (0,0), (-1,-1), row_bg),
+            ("TOPPADDING",   (0,0), (-1,-1), ROW_PAD),
+            ("BOTTOMPADDING",(0,0), (-1,-1), ROW_PAD),
+            ("LEFTPADDING",  (0,0), (-1,-1), ROW_PAD),
+            ("RIGHTPADDING", (0,0), (-1,-1), ROW_PAD),
+            ("LINEBEFORE",   (0,0), (-1,-1), 4, C["gold"]),
+            ("BOX",          (0,0), (-1,-1), 0.5, C["grid"]),
         ]))
         story.append(row)
+        story.append(Spacer(1, 4))
 
-    story.append(Spacer(1, 22))
-    story.append(ThinRule(BODY_W, C["gold"]))
+    # ── Footer note ─────────────────────────────────────────────────────
+    story.append(Spacer(1, 16))
+    story.append(HRFlowable(width=BODY_W, thickness=1, color=C["gold"],
+                             spaceAfter=0, spaceBefore=0))
     story.append(Spacer(1, 8))
     story.append(Paragraph(
-        "Every discovered host receives a full dedicated write-up inside "
-        "§ 04 — Host-by-Host Deep Dive, including open ports, vulnerabilities, "
-        "forensic evidence, and targeted remediation guidance.",
-        ParagraphStyle("_tocfoot", fontName="Helvetica-Oblique", fontSize=8.5,
-                        textColor=C["mid_gray"], leading=12)))
+        "Every discovered host receives a full write-up in \u00a7\u202f04 — Host-by-Host Deep Dive, "
+        "including open ports, confirmed vulnerabilities, forensic evidence, and targeted remediation.",
+        ParagraphStyle("_toc_ft", fontName="Helvetica-Oblique", fontSize=8.5,
+                        textColor=C["mid_gray"], leading=13)))
     story.append(PageBreak())
     return story
 
-
-# ═══════════════════════════════════════════════════════════════════════
-#  MAIN ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════
 async def generate_pdf_report(scan_id: str) -> bytes:
     # ── Lazy imports (avoids circular deps) ────────────────────────────
     from main import AsyncSessionLocal, Scan, Host, select, selectinload, compute_health_score
@@ -1571,21 +1737,66 @@ async def generate_pdf_report(scan_id: str) -> bytes:
 
     story.append(PageBreak())
 
-    # ── §2  METRICS ───────────────────────────────────────────────────
+    # ── §2  SCAN OVERVIEW & METRICS ───────────────────────────────────
     story.append(section_banner("2  ·  Scan Overview & Metrics", "◈"))
-    story.append(Spacer(1, 16))
+    story.append(Spacer(1, 20))
 
-    story.append(metric_cards([
-        (f"{int(health_score)}/100", "Security Score",  C["safe"] if health_score>70 else C["high"]),
-        (crit_count,  "Critical Findings", C["crit"]),
-        (high_count,  "High Findings",     C["high"]),
-        (med_count,   "Medium Findings",   C["med"]),
-        (len(hosts),  "Hosts Audited",     C["dark_blue"]),
-        (len(all_vulns), "Total Findings", C["mid_gray"]),
+    # ── Metric stat cards (2 rows × 3) ────────────────────────────────
+    def _stat_block(value, label, clr):
+        v_s = ParagraphStyle(f"_sv_{label}", fontName="Helvetica-Bold", fontSize=26,
+                             leading=30, textColor=clr, alignment=TA_CENTER)
+        l_s = ParagraphStyle(f"_sl_{label}", fontName="Helvetica", fontSize=8,
+                             leading=12, textColor=C["mid_gray"], alignment=TA_CENTER)
+        inner = Table([[Paragraph(str(value), v_s)], [Paragraph(label.upper(), l_s)]],
+                      colWidths=[BODY_W/3 - 14])
+        inner.setStyle(TableStyle([
+            ("TOPPADDING",    (0,0), (-1,-1), 0),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+            ("LEFTPADDING",   (0,0), (-1,-1), 0),
+        ]))
+        card = Table([[inner]], colWidths=[BODY_W/3])
+        card.setStyle(TableStyle([
+            ("BACKGROUND",   (0,0), (-1,-1), C["white"]),
+            ("TOPPADDING",   (0,0), (-1,-1), 18),
+            ("BOTTOMPADDING",(0,0), (-1,-1), 18),
+            ("LEFTPADDING",  (0,0), (-1,-1), 10),
+            ("RIGHTPADDING", (0,0), (-1,-1), 10),
+            ("LINEBEFORE",   (0,0), (-1,-1), 4, clr),
+            ("BOX",          (0,0), (-1,-1), 0.6, C["grid"]),
+        ]))
+        return card
+
+    score_color = C["safe"] if health_score > 70 else C["high"]
+    row1 = Table([[
+        _stat_block(f"{int(health_score)}/100", "Security Score", score_color),
+        _stat_block(crit_count,  "Critical Findings", C["crit"]),
+        _stat_block(high_count,  "High Findings",     C["high"]),
+    ]], colWidths=[BODY_W/3]*3)
+    row1.setStyle(TableStyle([
+        ("LEFTPADDING",  (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (-1,-1), 0),
+        ("TOPPADDING",   (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 0),
+        ("INNERGRID",    (0,0), (-1,-1), 6, C["light_gray"]),
     ]))
-    story.append(Spacer(1, 24))
+    row2 = Table([[
+        _stat_block(med_count,      "Medium Findings",  C["med"]),
+        _stat_block(len(hosts),     "Hosts Audited",    C["dark_blue"]),
+        _stat_block(len(all_vulns), "Total Findings",   C["mid_gray"]),
+    ]], colWidths=[BODY_W/3]*3)
+    row2.setStyle(TableStyle([
+        ("LEFTPADDING",  (0,0), (-1,-1), 0),
+        ("RIGHTPADDING", (0,0), (-1,-1), 0),
+        ("TOPPADDING",   (0,0), (-1,-1), 0),
+        ("BOTTOMPADDING",(0,0), (-1,-1), 0),
+        ("INNERGRID",    (0,0), (-1,-1), 6, C["light_gray"]),
+    ]))
+    story.append(row1)
+    story.append(Spacer(1, 6))
+    story.append(row2)
+    story.append(Spacer(1, 22))
 
-    # Charts inside a framed analytics panel
+    # ── Charts panel ───────────────────────────────────────────────────
     donut = build_vuln_chart(all_vulns)
     bars  = build_risk_bar_chart(hosts)
     if donut or bars:
@@ -1624,39 +1835,72 @@ async def generate_pdf_report(scan_id: str) -> bytes:
         story.append(chart_panel)
         story.append(Spacer(1, 14))
 
-    # Scan metadata table
+    # ── Scan metadata (2-column card style) ───────────────────────────
     dur_str = "N/A"
     if scan.started_at and scan.finished_at:
         secs = int((scan.finished_at - scan.started_at).total_seconds())
         dur_str = f"{secs//3600}h {(secs%3600)//60}m {secs%60}s"
 
-    meta_rows = [
-        [Paragraph("FIELD", styles["th"]), Paragraph("VALUE", styles["th"])],
-        [Paragraph("Scan ID",       styles["td"]), Paragraph(scan_id[:8], styles["td_mono"])],
-        [Paragraph("Target",        styles["td"]), Paragraph(scan.target, styles["td_mono"])],
-        [Paragraph("Start Time",    styles["td"]),
-         Paragraph(scan.started_at.strftime("%Y-%m-%d %H:%M:%S UTC") if scan.started_at else "N/A",
-                   styles["td"])],
-        [Paragraph("Finish Time",   styles["td"]),
-         Paragraph(scan.finished_at.strftime("%Y-%m-%d %H:%M:%S UTC") if scan.finished_at else "N/A",
-                   styles["td"])],
-        [Paragraph("Duration",      styles["td"]), Paragraph(dur_str, styles["td"])],
-        [Paragraph("Hosts Found",   styles["td"]), Paragraph(str(len(hosts)), styles["td"])],
-        [Paragraph("Total Vulns",   styles["td"]), Paragraph(str(len(all_vulns)), styles["td"])],
-        [Paragraph("Security Score",styles["td"]), Paragraph(f"{int(health_score)}/100", styles["td"])],
+    meta_field_s = ParagraphStyle("_mf", fontName="Helvetica-Bold", fontSize=9,
+                                   textColor=C["dark_blue"], leading=13)
+    meta_val_s   = ParagraphStyle("_mv", fontName="Courier",         fontSize=9,
+                                   textColor=C["black"],     leading=13)
+
+    meta_items = [
+        ("Scan ID",       scan_id[:8] + "..."),
+        ("Target",        scan.target),
+        ("Start Time",    scan.started_at.strftime("%Y-%m-%d %H:%M:%S UTC") if scan.started_at else "N/A"),
+        ("Finish Time",   scan.finished_at.strftime("%Y-%m-%d %H:%M:%S UTC") if scan.finished_at else "N/A"),
+        ("Duration",      dur_str),
+        ("Hosts Found",   str(len(hosts))),
+        ("Total Vulns",   str(len(all_vulns))),
+        ("Security Score",f"{int(health_score)}/100"),
     ]
-    meta_table = Table(meta_rows, colWidths=[2*inch, BODY_W - 2*inch])
-    meta_table.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0), (-1,0), C["dark_blue"]),
-        ("PADDING",       (0,0), (-1,-1), 8),
-        ("LINEBELOW",     (0,0), (-1,0), 1.5, C["gold"]),
-        ("GRID",          (0,1), (-1,-1), 0.4, C["grid"]),
-        ("ROWBACKGROUNDS",(0,1), (-1,-1), [C["white"], C["stripe"]]),
-        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-    ]))
-    story.append(Spacer(1, 10))
-    story.append(meta_table)
+
+    def _meta_card(field, val, w):
+        t = Table(
+            [[Paragraph(field, meta_field_s)],
+             [Paragraph(xml_escape(str(val)), meta_val_s)]],
+            colWidths=[w - 20])
+        t.setStyle(TableStyle([
+            ("TOPPADDING",    (0,0), (-1,-1), 0),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+            ("LEFTPADDING",   (0,0), (-1,-1), 0),
+        ]))
+        card = Table([[t]], colWidths=[w])
+        card.setStyle(TableStyle([
+            ("BACKGROUND",   (0,0), (-1,-1), C["stripe"]),
+            ("TOPPADDING",   (0,0), (-1,-1), 10),
+            ("BOTTOMPADDING",(0,0), (-1,-1), 10),
+            ("LEFTPADDING",  (0,0), (-1,-1), 14),
+            ("RIGHTPADDING", (0,0), (-1,-1), 10),
+            ("LINEBEFORE",   (0,0), (-1,-1), 3, C["dark_blue"]),
+            ("BOX",          (0,0), (-1,-1), 0.4, C["grid"]),
+        ]))
+        return card
+
+    story.append(Paragraph("▸ SCAN METADATA",
+                            ParagraphStyle("_smlbl", fontName="Helvetica-Bold", fontSize=9,
+                                           textColor=C["dark_blue"])))
+    story.append(Spacer(1, 6))
+    HW = BODY_W / 2
+    for i in range(0, len(meta_items), 2):
+        left  = meta_items[i]
+        right = meta_items[i+1] if i+1 < len(meta_items) else None
+        left_card  = _meta_card(left[0], left[1], HW)
+        right_card = _meta_card(right[0], right[1], HW) if right else Spacer(HW, 1)
+        pair_row = Table([[left_card, right_card]], colWidths=[HW, HW])
+        pair_row.setStyle(TableStyle([
+            ("LEFTPADDING",  (0,0), (-1,-1), 0),
+            ("RIGHTPADDING", (0,0), (-1,-1), 0),
+            ("TOPPADDING",   (0,0), (-1,-1), 0),
+            ("BOTTOMPADDING",(0,0), (-1,-1), 0),
+            ("INNERGRID",    (0,0), (-1,-1), 6, C["white"]),
+        ]))
+        story.append(pair_row)
+        story.append(Spacer(1, 5))
     story.append(PageBreak())
+
 
     # ── §3  NETWORK MAP ───────────────────────────────────────────────
     story.append(section_banner("3  ·  Discovered Hosts — Network Map", "◈"))
@@ -1795,18 +2039,31 @@ async def generate_pdf_report(scan_id: str) -> bytes:
         host_elems.append(Paragraph("Remediation Strategy", styles["h3"]))
         host_elems.append(ThinRule(BODY_W, C["grid"]))
         host_elems.append(Spacer(1, 6))
-        recs = [
-            "Immediately patch or isolate services with Critical/High CVEs.",
-            "Apply firewall rules to restrict service access to authorised subnets only.",
-            "Enforce multi-factor authentication on all management interfaces.",
-            "Disable or remove legacy protocols (Telnet, FTP) — replace with SSH/SFTP.",
-            "Schedule monthly automated scans to track remediation progress.",
-        ]
-        if meaningful:
-            cve_ids = [v["cve_id"] for v in meaningful if v.get("cve_id")]
-            if cve_ids:
-                recs.insert(0, f"Apply vendor patches for {', '.join(cve_ids[:3])} immediately.")
-        host_elems.append(rec_box(recs, styles))
+
+        # Gather LLM remediation for each meaningful vulnerability on this host
+        recs = []
+        seen = set()
+        for v in (meaningful or [])[:4]:   # top 4 vulns to keep box compact
+            cve   = v.get("cve_id") or ""
+            cvss  = f"{v['cvss_score']:.1f}" if v.get("cvss_score") else "—"
+            raw_r = v.get("remediation") or ""
+            if not raw_r.strip() or len(raw_r.strip()) < 15:
+                raw_r = get_remediation_sync(
+                    v.get("name", ""), cve, v.get("severity", "info"), cvss
+                )
+            for line in raw_r.split("\n"):
+                line = line.strip().lstrip("-").strip()
+                if line and line not in seen:
+                    seen.add(line)
+                    recs.append(line)
+            if len(recs) >= 6:
+                break
+
+        if not recs:
+            # Absolute last resort if host has no vulns at all
+            recs = ["No critical vulnerabilities detected — maintain current patch cycle "
+                    "and schedule a follow-up scan in 30 days."]
+        host_elems.append(rec_box(recs[:6], styles))
 
         story.append(KeepTogether(host_elems[:12]))  # keep first block together
         story.extend(host_elems[12:])                # rest flows naturally
@@ -1906,13 +2163,30 @@ async def generate_pdf_report(scan_id: str) -> bytes:
                     styles))
             story.append(Spacer(1, 12))
     else:
-        story.append(rec_box([
-            "Maintain patch cycles — apply OS and application updates weekly.",
-            "Review firewall rules quarterly; remove unused ALLOW entries.",
-            "Deploy an Intrusion Detection System (IDS/IPS) on the perimeter.",
-            "Implement network segmentation to limit lateral movement.",
-            "Conduct an internal red-team exercise within the next 90 days.",
-        ], styles))
+        # LLM fallback: derive strategic recs from top vulns across all hosts
+        fallback_recs = []
+        seen_fb = set()
+        top_vulns = sorted(all_vulns,
+                           key=lambda v: {"critical":0,"high":1,"medium":2,"low":3,"info":4}
+                                         .get(v.get("severity","info").lower(), 4))[:5]
+        for v in top_vulns:
+            cve  = v.get("cve_id") or ""
+            cvss = f"{v['cvss_score']:.1f}" if v.get("cvss_score") else "—"
+            raw_r = v.get("remediation") or ""
+            if not raw_r.strip() or len(raw_r.strip()) < 15:
+                raw_r = get_remediation_sync(v.get("name",""), cve,
+                                             v.get("severity","info"), cvss)
+            for line in raw_r.split("\n"):
+                line = line.strip().lstrip("-").strip()
+                if line and line not in seen_fb:
+                    seen_fb.add(line)
+                    fallback_recs.append(line)
+            if len(fallback_recs) >= 6:
+                break
+        if not fallback_recs:
+            fallback_recs = ["No critical vulnerabilities found — maintain current patch "
+                             "and monitoring cadence."]
+        story.append(rec_box(fallback_recs[:6], styles))
 
     story.append(PageBreak())
 
