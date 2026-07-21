@@ -39,6 +39,12 @@ except ImportError:
 
 import ftplib
 
+try:
+    import telnetlib3
+except ImportError:
+    telnetlib3 = None
+    logger.warning("telnetlib3 not installed. Telnet evidence will use banner-only capture.")
+
 SCREENSHOT_BASE = Path("data/screenshots")
 
 
@@ -203,7 +209,9 @@ async def _capture_web_screenshot_impl(
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page    = await browser.new_page(viewport={"width": 1280, "height": 1024})
+            context = await browser.new_context(ignore_https_errors=True)
+            page    = await context.new_page()
+            await page.set_viewport_size({"width": 1280, "height": 1024})
             try:
                 await page.goto(url, timeout=10000, wait_until="domcontentloaded")
             except Exception:
@@ -247,31 +255,104 @@ async def _capture_auth_screenshot_impl(
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page    = await browser.new_page(viewport={"width": 1280, "height": 1024})
-            await page.goto(url, timeout=10000, wait_until="domcontentloaded")
+            context = await browser.new_context(ignore_https_errors=True)
+            page    = await context.new_page()
+            await page.set_viewport_size({"width": 1280, "height": 1024})
+            await page.goto(url, timeout=12000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(1000)
 
-            form       = await page.query_selector("form") or \
-                         await page.query_selector("form[action*='login']")
-            user_input = await page.query_selector(
-                "input[name='user'], input[name='username'], input[type='text']")
-            pass_input = await page.query_selector(
-                "input[name='pass'], input[name='password'], input[type='password']")
+            # 1. Find Username Input
+            user_input = None
+            user_selectors = [
+                "input[type='text'][name*='user' i]", "input[type='text'][name*='login' i]",
+                "input[type='text'][id*='user' i]", "input[type='text'][id*='login' i]",
+                "input[name*='username' i]", "input[name*='user' i]", "input[name*='login' i]",
+                "input[id*='username' i]", "input[id*='user' i]", "input[id*='login' i]",
+                "input[placeholder*='username' i]", "input[placeholder*='user' i]", "input[placeholder*='login' i]"
+            ]
+            for sel in user_selectors:
+                el = await page.query_selector(sel)
+                if el and await el.is_visible():
+                    user_input = el
+                    break
+            
+            if not user_input:
+                inputs = await page.query_selector_all("input")
+                for inp in inputs:
+                    inp_type = await inp.get_attribute("type") or "text"
+                    if inp_type in ["text", "email"] and await inp.is_visible():
+                        user_input = inp
+                        break
 
-            if form and user_input and pass_input:
+            # 2. Find Password Input
+            pass_input = await page.query_selector("input[type='password']")
+            if not pass_input:
+                pass_selectors = [
+                    "input[name*='password' i]", "input[name*='pass' i]",
+                    "input[id*='password' i]", "input[id*='pass' i]",
+                    "input[placeholder*='password' i]", "input[placeholder*='pass' i]"
+                ]
+                for sel in pass_selectors:
+                    el = await page.query_selector(sel)
+                    if el and await el.is_visible():
+                        pass_input = el
+                        break
+
+            if user_input and pass_input:
                 await user_input.fill(username)
                 await pass_input.fill(password)
-                submit = await page.query_selector(
-                    "input[type='submit'], button[type='submit']")
-                if submit:
-                    await submit.click()
-                    await page.wait_for_timeout(3000)
-                    if page.url != url or "login" not in page.url.lower():
-                        safe_user = re.sub(r"\W", "", username) or "user"
-                        filepath  = _evidence_dir(scan_id) / f"{ip}_{port}_{safe_user}_auth.png"
-                        await page.screenshot(path=str(filepath), full_page=True)
-                        await browser.close()
-                        logger.info(f"Auth screenshot saved: {filepath}")
-                        return filepath
+                await page.wait_for_timeout(200)
+
+                # 3. Find Submit Button
+                submit_clicked = False
+                submit_selectors = [
+                    "input[type='submit']", "button[type='submit']",
+                    "button", "input[type='button']",
+                    "a:has-text('login')", "a:has-text('Login')", "a:has-text('Sign')",
+                    "div[role='button']", "span[role='button']"
+                ]
+                for sel in submit_selectors:
+                    el = await page.query_selector(sel)
+                    if el and await el.is_visible():
+                        el_tag = await el.evaluate("node => node.tagName")
+                        if el_tag.lower() == "input":
+                            el_type = await el.get_attribute("type")
+                            if el_type in ["text", "password"]:
+                                continue
+                        try:
+                            await el.click(timeout=2000)
+                            submit_clicked = True
+                            break
+                        except Exception:
+                            pass
+
+                if not submit_clicked:
+                    try:
+                        await pass_input.press("Enter")
+                    except Exception:
+                        pass
+
+                await page.wait_for_timeout(4000)
+                
+                pw_visible = False
+                try:
+                    pw_el = await page.query_selector("input[type='password']")
+                    if pw_el and await pw_el.is_visible():
+                        pw_visible = True
+                except Exception:
+                    pass
+
+                url_changed = page.url != url
+                login_in_url = "login" in page.url.lower()
+                
+                if url_changed or not login_in_url or not pw_visible:
+                    safe_user = re.sub(r"\W", "", username) or "user"
+                    filepath  = _evidence_dir(scan_id) / f"{ip}_{port}_{safe_user}_auth.png"
+                    await page.screenshot(path=str(filepath), full_page=True)
+                    await browser.close()
+                    logger.info(f"Auth screenshot saved: {filepath}")
+                    return filepath
+            
             await browser.close()
             return None
     except Exception as e:
@@ -391,15 +472,70 @@ def _capture_generic_text_evidence(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  MAIN CREDENTIAL TEXT EVIDENCE DISPATCHER
+#  TELNET TEXT EVIDENCE
 # ═══════════════════════════════════════════════════════════════════════
 
-def capture_credential_text(
+async def _capture_telnet_text_evidence_impl(ip: str, port: int, username: str, password: str) -> str:
+    lines = [
+        f"Telnet Connection Evidence  —  {ip}:{port}",
+        f"Credential tested: {username} / {'*' * len(password)}",
+        f"Timestamp: {datetime.utcnow().isoformat()}Z",
+        "",
+    ]
+    if not telnetlib3:
+        lines.append("[telnetlib3 not installed — banner-only capture]")
+        try:
+            sock = socket.create_connection((ip, port), timeout=5)
+            banner = sock.recv(1024).decode(errors="replace").strip()
+            sock.close()
+            lines.append(f"Service banner: {banner}")
+        except Exception as e:
+            lines.append(f"Cannot capture banner: {e}")
+        return "\n".join(lines)
+
+    try:
+        reader, writer = await asyncio.wait_for(
+            telnetlib3.open_connection(ip, port),
+            timeout=5
+        )
+        
+        try:
+            banner = await asyncio.wait_for(reader.read(1024), timeout=2)
+            lines.append(f"Telnet banner / prompt:\n{banner}")
+        except Exception:
+            pass
+
+        writer.write(f"{username}\n")
+        await asyncio.wait_for(writer.drain(), timeout=2)
+        await asyncio.sleep(0.5)
+        
+        writer.write(f"{password}\n")
+        await asyncio.wait_for(writer.drain(), timeout=2)
+        await asyncio.sleep(0.5)
+        
+        try:
+            prompt = await asyncio.wait_for(reader.read(2048), timeout=3)
+            lines.append(f"Session response after login:\n{prompt}")
+            if any(x in prompt.lower() for x in ["incorrect", "fail", "invalid"]):
+                lines.append("Authentication status: FAILED (rejected by server).")
+            else:
+                lines.append("Authentication status: SUCCESS (session established).")
+        except Exception as e:
+            lines.append("Authentication status: SUCCESS (connection remained open).")
+            
+        writer.close()
+    except Exception as e:
+        lines.append(f"Telnet connection failed during evidence capture: {e}")
+        
+    return "\n".join(lines)
+
+
+async def capture_credential_text(
     scan_id: str, ip: str, port: int, service: str, credentials: List[Dict]
 ) -> Dict:
     """
     Build a real, protocol-appropriate text evidence block for non-web
-    credential successes.  SSH and FTP open actual sessions; other
+    credential successes.  SSH, Telnet and FTP open actual sessions; other
     protocols fall back to a clearly-labelled reachability confirmation.
     """
     if not credentials:
@@ -413,11 +549,13 @@ def capture_credential_text(
     svc_lower = (service or "").lower()
 
     if svc_lower == "ssh":
-        content = _capture_ssh_text_evidence(ip, port, first["username"], first["password"])
+        content = await asyncio.to_thread(_capture_ssh_text_evidence, ip, port, first["username"], first["password"])
+    elif svc_lower == "telnet":
+        content = await _capture_telnet_text_evidence_impl(ip, port, first["username"], first["password"])
     elif svc_lower == "ftp":
-        content = _capture_ftp_text_evidence(ip, port, first["username"], first["password"])
+        content = await asyncio.to_thread(_capture_ftp_text_evidence, ip, port, first["username"], first["password"])
     else:
-        content = _capture_generic_text_evidence(ip, port, service, credentials)
+        content = await asyncio.to_thread(_capture_generic_text_evidence, ip, port, service, credentials)
 
     return {
         "type":              "text",

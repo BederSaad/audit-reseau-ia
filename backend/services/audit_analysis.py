@@ -549,9 +549,10 @@ TOP VULNERABILITIES (CVSS & URGENCY — top 5):
         json_match = re.search(r'\{[\s\S]*\}', raw)
         if not json_match:
             raise ValueError("No JSON object found in LLM response")
-        parsed = json.loads(json_match.group())
+        parsed = json.loads(json_match.group(), strict=False)
         parsed["ai_generated"] = True
         return parsed
+
 
     fallback = build_fallback_analysis(context)
     

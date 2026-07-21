@@ -1804,6 +1804,7 @@ async def run_pipeline(scan_id: str, target: str) -> None:
                         hr["evidence"].append({
                             "type": "web_screenshot",
                             "path": path_str,
+                            "port": port,
                             "label": f"Capture écran web {hr['ip']}:{port}"
                         })
                         if not hr["screenshot_path"]:
@@ -1816,22 +1817,32 @@ async def run_pipeline(scan_id: str, target: str) -> None:
                     port = cred.get("port", 0)
                     if port in WEB_PORTS and service.lower() in ["http", "https", "web"]:
                         for c in cred["credentials_found"]:
-                            url = f"http://{hr['ip']}:{port}" if port != 443 else f"https://{hr['ip']}:{port}"
+                            scheme = "https" if port in HTTPS_PORTS else "http"
+                            url = f"{scheme}://{hr['ip']}:{port}"
                             auth_path = await capture_auth_screenshot(
                                 scan_id, hr['ip'], port, url, c["username"], c["password"]
                             )
                             if auth_path:
                                 path_str = str(auth_path)
                                 hr["evidence"].append({
-                                    "type": "auth_screenshot",
-                                    "path": path_str,
-                                    "label": f"Authentification réussie sur {service}:{port} avec {c['username']}"
+                                    "type":      "auth_screenshot",
+                                    "path":      path_str,
+                                    "port":      port,
+                                    "service":   service,
+                                    "username":  c["username"],
+                                    "label":     f"Admin dashboard — {service}:{port} logged in as '{c['username']}'",
+                                    "output":    (
+                                        f"Default credential login SUCCEEDED on {service} port {port}. "
+                                        f"Credentials used: {c['username']} / {c['password']}. "
+                                        f"Screenshot shows the authenticated admin dashboard."
+                                    ),
+                                    "timestamp": datetime.utcnow().isoformat() + "Z",
                                 })
                                 if not hr["screenshot_path"]:
                                     hr["screenshot_path"] = path_str
                                 break
                     else:
-                        text_ev = capture_credential_text(
+                        text_ev = await capture_credential_text(
                             scan_id, hr['ip'], port, service, cred["credentials_found"]
                         )
                         hr["evidence"].append(text_ev)

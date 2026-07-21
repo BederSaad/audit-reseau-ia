@@ -13,8 +13,22 @@ import ftplib
 import logging
 import json
 import time
+import httpx
+import urllib3
 from datetime import datetime
 from typing import Dict, List, Optional
+
+# Suppress SSL warnings for self-signed certificates on network devices
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+import re
+try:
+    from playwright.async_api import async_playwright
+except ImportError:
+    async_playwright = None
+    logging.warning("playwright not installed - Web interface credential testing will use HTTP fallback")
+
+
 
 # Service-specific libraries (will be installed as dependencies)
 try:
@@ -118,6 +132,26 @@ DEFAULT_CREDENTIALS = {
     "mysql": [("root", ""), ("root", "root"), ("root", "password")],
     "postgresql": [("postgres", "postgres"), ("postgres", "password"), ("postgres", "")],
 }
+
+WEB_PORTS = {80, 443, 8080, 8443, 3000, 8000, 8888, 9090, 9443, 4443}
+HTTPS_PORTS = {443, 8443, 9443, 4443}
+
+# Comprehensive list of default credentials for Web Interfaces (Routers, Cameras, NAS, Switches, Huawei, TP-Link, etc.)
+WEB_DEFAULT_CREDENTIALS = [
+    ("topadmin", "topadmin"), ("telecomadmin", "admintelecom"),
+    ("admin", "admin"), ("admin", "password"), ("admin", "1234"), 
+    ("admin", "12345"), ("admin", "123456"), ("admin", "12345678"), 
+    ("admin", "1234567890"), ("admin", ""), ("admin", "admin123"), 
+    ("admin", "Admin@123"), ("admin", "root"), ("admin", "hikvision"), 
+    ("admin", "h3c"), ("admin", "ubnt"), ("admin", "cisco"), 
+    ("admin", "mikrotik"), ("admin", "synology"), ("admin", "qnap"), 
+    ("root", "root"), ("root", "admin"), ("root", ""), ("root", "1234"), 
+    ("user", "user"), ("user", "1234"), ("guest", "guest"), ("guest", ""), 
+    ("support", "support"), ("cisco", "cisco"), ("sa", ""), 
+    ("administrator", ""), ("administrator", "password"), ("admin", "admin1234"),
+    ("admin", "changeme"), ("admin", "letmein"), ("admin", "welcome")
+]
+
 
 
 
@@ -356,17 +390,21 @@ async def test_smb_credentials(ip: str, port: int = 445) -> Dict:
         result["attempts_made"] += 1
         try:
             def _try_login():
-                smb = SMBConnection(
-                    username, password, 
-                    client_ip='', 
-                    remote_ip=ip,
-                    timeout=5
-                )
-                # Try to connect to IPC$ share which is usually accessible
-                success = smb.connect(ip, port)
-                if success:
-                    smb.close()
-                return success
+                try:
+                    smb = SMBConnection(
+                        remoteName=ip,
+                        remoteHost=ip,
+                        sess_port=port,
+                        timeout=5
+                    )
+                    smb.login(username, password)
+                    try:
+                        smb.logoff()
+                    except Exception:
+                        pass
+                    return True
+                except Exception:
+                    return False
 
             success = await asyncio.to_thread(_try_login)
             if success:
@@ -558,6 +596,279 @@ async def test_vnc_exposure(ip: str, port: int = 5900) -> Dict:
     return result
 
 
+async def test_web_credentials(ip: str, port: int, scheme: str) -> Dict:
+    """
+    Test default web credentials against target host.
+    Tries Playwright browser-based login first (to handle JS-based single-page apps),
+    and falls back to HTTP Basic Auth and common POST endpoints if Playwright fails.
+    """
+    cached = await get_cached_cred_result(ip, port, "web")
+    if cached:
+        return cached
+
+    result = {
+        "service": "web",
+        "port": port,
+        "tested": True,
+        "vulnerable": False,
+        "credentials_found": [],
+        "attempts_made": 0,
+        "tested_at": datetime.utcnow().isoformat()
+    }
+
+    url = f"{scheme}://{ip}:{port}"
+
+    # Try browser-based credential testing first if Playwright is available
+    if async_playwright:
+        logger.info(f"[CRED TEST] Starting browser-based credential test for {url}")
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(ignore_https_errors=True)
+                page = await context.new_page()
+                await page.set_viewport_size({"width": 1280, "height": 1024})
+                
+                # Navigate to the page
+                try:
+                    await page.goto(url, timeout=12000, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(1000)
+                except Exception as e:
+                    logger.debug(f"[CRED TEST] Browser navigation failed to {url}: {e}")
+                    await browser.close()
+                    raise e
+                
+                # Find input fields
+                user_selectors = [
+                    "input[type='text'][name*='user' i]", "input[type='text'][name*='login' i]",
+                    "input[type='text'][id*='user' i]", "input[type='text'][id*='login' i]",
+                    "input[name*='username' i]", "input[name*='user' i]", "input[name*='login' i]",
+                    "input[id*='username' i]", "input[id*='user' i]", "input[id*='login' i]",
+                    "input[placeholder*='username' i]", "input[placeholder*='user' i]", "input[placeholder*='login' i]"
+                ]
+                pass_selectors = [
+                    "input[type='password']",
+                    "input[name*='password' i]", "input[name*='pass' i]",
+                    "input[id*='password' i]", "input[id*='pass' i]",
+                    "input[placeholder*='password' i]", "input[placeholder*='pass' i]"
+                ]
+
+                user_input = None
+                for sel in user_selectors:
+                    try:
+                        el = await page.query_selector(sel)
+                        if el and await el.is_visible():
+                            user_input = el
+                            break
+                    except Exception:
+                        pass
+                
+                if not user_input:
+                    try:
+                        inputs = await page.query_selector_all("input")
+                        for inp in inputs:
+                            inp_type = await inp.get_attribute("type") or "text"
+                            if inp_type in ["text", "email"] and await inp.is_visible():
+                                user_input = inp
+                                break
+                    except Exception:
+                        pass
+
+                pass_input = None
+                for sel in pass_selectors:
+                    try:
+                        el = await page.query_selector(sel)
+                        if el and await el.is_visible():
+                            pass_input = el
+                            break
+                    except Exception:
+                        pass
+
+                if not user_input or not pass_input:
+                    logger.debug(f"[CRED TEST] Browser could not find username/password inputs on {url}. Falling back to HTTP.")
+                    await browser.close()
+                else:
+                    # Try default credentials one by one
+                    for username, password in WEB_DEFAULT_CREDENTIALS:
+                        result["attempts_made"] += 1
+                        try:
+                            # Clean the fields and fill new credentials
+                            await user_input.fill("")
+                            await user_input.type(username)
+                            await pass_input.fill("")
+                            await pass_input.type(password)
+                            await page.wait_for_timeout(200)
+
+                            # Find and click submit button
+                            submit_clicked = False
+                            submit_selectors = [
+                                "input[type='submit']", "button[type='submit']",
+                                "button", "input[type='button']",
+                                "a:has-text('login')", "a:has-text('Login')", "a:has-text('Sign')",
+                                "div[role='button']", "span[role='button']"
+                            ]
+                            for sel in submit_selectors:
+                                try:
+                                    el = await page.query_selector(sel)
+                                    if el and await el.is_visible():
+                                        el_tag = await el.evaluate("node => node.tagName")
+                                        if el_tag.lower() == "input":
+                                            el_type = await el.get_attribute("type")
+                                            if el_type in ["text", "password"]:
+                                                continue
+                                        await el.click(timeout=1500)
+                                        submit_clicked = True
+                                        break
+                                except Exception:
+                                    pass
+
+                            if not submit_clicked:
+                                try:
+                                    await pass_input.press("Enter")
+                                except Exception:
+                                    pass
+
+                            # Wait for redirect or DOM updates
+                            await page.wait_for_timeout(2500)
+
+                            # Check success criteria
+                            pw_visible = False
+                            try:
+                                pw_el = await page.query_selector("input[type='password']")
+                                if pw_el and await pw_el.is_visible():
+                                    pw_visible = True
+                            except Exception:
+                                pass
+
+                            body_text = ""
+                            try:
+                                body_el = await page.query_selector("body")
+                                if body_el:
+                                    body_text = await body_el.inner_text()
+                            except Exception:
+                                pass
+                            body_text_lower = body_text.lower()
+
+                            # Detect failure strings
+                            has_error = False
+                            if pw_visible:
+                                error_keywords = ["incorrect", "fail", "invalid", "wrong", "erreur", "échec", "tentative", "authentification échouée"]
+                                if any(kw in body_text_lower for kw in error_keywords):
+                                    has_error = True
+
+                            success = False
+                            if not pw_visible and not has_error:
+                                success = True
+                            elif not has_error and any(kw in body_text_lower for kw in ["logout", "déconnexion", "dashboard", "status", "statut", "system", "router info", "configuration"]):
+                                success = True
+
+                            if success:
+                                result["vulnerable"] = True
+                                result["credentials_found"].append({"username": username, "password": password})
+                                logger.warning(f"[CRED TEST] BROWSER LOGIN SUCCESS: {url} with {username}:{password}")
+                                break
+                            else:
+                                logger.debug(f"[CRED TEST] Browser login failed for {username}:{password} on {url}")
+                                
+                                # If we navigated away but it failed, return to login page
+                                if page.url != url:
+                                    try:
+                                        await page.goto(url, timeout=8000, wait_until="domcontentloaded")
+                                        await page.wait_for_timeout(1000)
+                                    except Exception:
+                                        pass
+                                    # Re-find input elements
+                                    user_input = None
+                                    for sel in user_selectors:
+                                        try:
+                                            el = await page.query_selector(sel)
+                                            if el and await el.is_visible():
+                                                user_input = el
+                                                break
+                                        except Exception:
+                                            pass
+                                    if not user_input:
+                                        try:
+                                            inputs = await page.query_selector_all("input")
+                                            for inp in inputs:
+                                                inp_type = await inp.get_attribute("type") or "text"
+                                                if inp_type in ["text", "email"] and await inp.is_visible():
+                                                    user_input = inp
+                                                    break
+                                        except Exception:
+                                            pass
+
+                                    pass_input = None
+                                    for sel in pass_selectors:
+                                        try:
+                                            el = await page.query_selector(sel)
+                                            if el and await el.is_visible():
+                                                pass_input = el
+                                                break
+                                        except Exception:
+                                            pass
+                        except Exception as e:
+                            logger.debug(f"[CRED TEST] Browser login error during {username}:{password} on {url}: {e}")
+                    
+                    await browser.close()
+                    await set_cached_cred_result(ip, port, "web", result)
+                    return result
+        except Exception as e:
+            logger.warning(f"[CRED TEST] Browser-based credential test failed for {url}: {e}. Falling back to HTTP client.")
+
+    # Fallback to HTTP client requests (Basic Auth & standard POST endpoints)
+    async with httpx.AsyncClient(verify=False, timeout=10.0, follow_redirects=True) as client:
+        for username, password in WEB_DEFAULT_CREDENTIALS:
+            result["attempts_made"] += 1
+            try:
+                # 1. Try HTTP Basic Auth
+                resp = await client.get(url, auth=(username, password))
+                if resp.status_code == 200:
+                    content_lower = resp.text.lower()
+                    if "invalid" not in content_lower and "failed" not in content_lower and "incorrect" not in content_lower:
+                        result["vulnerable"] = True
+                        result["credentials_found"].append({"username": username, "password": password})
+                        logger.warning(f"[CRED TEST] WEAK WEB LOGIN FOUND (Basic Auth): {scheme}://{username}:{password}@{ip}:{port}")
+                        break
+                
+                # 2. Try form POST endpoints
+                for endpoint in ["/login", "/api/login", "/cgi-bin/login"]:
+                    try:
+                        json_resp = await client.post(f"{url}{endpoint}", json={"username": username, "password": password, "user": username, "pass": password})
+                        if json_resp.status_code == 200:
+                            j_text = json_resp.text.lower()
+                            if "success" in j_text or "token" in j_text or ("invalid" not in j_text and "failed" not in j_text):
+                                result["vulnerable"] = True
+                                result["credentials_found"].append({"username": username, "password": password})
+                                logger.warning(f"[CRED TEST] WEAK WEB LOGIN FOUND (JSON POST): {url}{endpoint}")
+                                break
+                    except Exception:
+                        pass
+                    
+                    try:
+                        form_resp = await client.post(f"{url}{endpoint}", data={"username": username, "password": password, "user": username, "pass": password})
+                        if form_resp.status_code == 200:
+                            f_text = form_resp.text.lower()
+                            if "success" in f_text or "token" in f_text or ("invalid" not in f_text and "failed" not in f_text):
+                                result["vulnerable"] = True
+                                result["credentials_found"].append({"username": username, "password": password})
+                                logger.warning(f"[CRED TEST] WEAK WEB LOGIN FOUND (Form POST): {url}{endpoint}")
+                                break
+                    except Exception:
+                        pass
+                
+                if result["vulnerable"]:
+                    break
+
+            except Exception as e:
+                logger.debug(f"[CRED TEST] HTTP web {url} {username}:{password} failed: {e}")
+            
+            await asyncio.sleep(0.5)
+
+    await set_cached_cred_result(ip, port, "web", result)
+    return result
+
+
+
 # =============================================================================
 # SERVICE PORT MAPPING AND ORCHESTRATOR
 # =============================================================================
@@ -603,6 +914,10 @@ async def run_credential_tests(host_result: Dict) -> List[Dict]:
             service_name, test_func = SERVICE_PORT_MAP[port]
             logger.info(f"[CRED TEST] Scheduling {service_name} test for {ip}:{port}")
             tasks.append(test_func(ip, port))
+        elif port in WEB_PORTS and state == "open":
+            scheme = "https" if port in HTTPS_PORTS else "http"
+            logger.info(f"[CRED TEST] Scheduling web test for {ip}:{port}")
+            tasks.append(test_web_credentials(ip, port, scheme))
 
     if not tasks:
         logger.debug(f"[CRED TEST] No matching services to test for host {ip}")
@@ -681,20 +996,31 @@ def credential_results_to_vulnerabilities(host_id: str, cred_results: List[Dict]
             username = cred.get("username", "")
             password = cred.get("password", "")
             
+            # Custom naming and description for Web Interfaces
+            if service == "web":
+                name = f"Identifiants par défaut détectés sur l'interface Web (Port {port})"
+                desc = (
+                    f"L'interface web sur le port {port} accepte les identifiants par défaut "
+                    f"'{username}/{password}'. Cela permet un accès non autorisé immédiat à l'interface d'administration."
+                )
+            else:
+                name = f"Identifiants par défaut détectés sur {service.upper()}"
+                desc = (
+                    f"Le service {service.upper()} sur le port {port} "
+                    f"accepte les identifiants par défaut '{username}/{password}'. "
+                    f"Cela permet un accès non autorisé immédiat sans exploitation technique."
+                )
+
             vulns.append({
                 "host_id": host_id,
                 "template_id": f"weak-cred-{service}",
-                "name": f"Identifiants par défaut détectés sur {service.upper()}",
+                "name": name,
                 "severity": "critical",  # Working default login is always critical
                 "cve_id": None,
                 "cvss_score": 9.8,
                 "cvss_estimated": True,
                 "matcher_name": f"{username}:{password}",
-                "description": (
-                    f"Le service {service.upper()} sur le port {port} "
-                    f"accepte les identifiants par défaut '{username}/{password}'. "
-                    f"Cela permet un accès non autorisé immédiat sans exploitation technique."
-                ),
+                "description": desc,
                 "source": "credential_test",
                 "discovered_at": datetime.utcnow(),
             })

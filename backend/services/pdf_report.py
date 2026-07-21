@@ -177,6 +177,13 @@ def get_vuln_description_sync(name: str, cve_id: str, severity: str, cvss: str) 
     return desc
 
 
+SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
+def sort_vulns_by_severity(vulns: list) -> list:
+    """Sort vulnerabilities from most critical to least critical."""
+    return sorted(vulns, key=lambda v: SEV_ORDER.get(str(v.get("severity", "info")).lower(), 4))
+
+
 _vuln_rem_cache: dict = {}   # {vuln_key: remediation}
 
 def get_remediation_sync(name: str, cve_id: str, severity: str, cvss: str) -> str:
@@ -1594,7 +1601,127 @@ def build_toc(hosts: list, styles: dict) -> list:
     story.append(PageBreak())
     return story
 
+
+# ═══════════════════════════════════════════════════════════════════════
+#  LLM MANUAL HARDENING INSTRUCTIONS
+# ═══════════════════════════════════════════════════════════════════════
+_manual_actions_cache: dict = {}
+
+def _get_manual_actions_sync(
+    ip: str,
+    os_name: str,
+    services: list,
+    vulns: list,
+) -> list:
+    """
+    Ask the local Ollama LLM for step-by-step manual hardening actions
+    that a sysadmin can take RIGHT NOW to improve this specific host.
+    Returns a list of instruction strings. Falls back to a built-in
+    template when Ollama is not reachable.
+    """
+    cache_key = f"manual:{ip}:{os_name}"
+    if cache_key in _manual_actions_cache:
+        return _manual_actions_cache[cache_key]
+
+    port_list = ", ".join(
+        f"{s['port']}/{s.get('protocol','tcp')} ({s.get('name','?')})"
+        for s in services[:10]
+    )
+    vuln_summary = "; ".join(
+        f"{v.get('severity','?').upper()} - {v.get('name','?')[:60]}"
+        for v in vulns[:5]
+    )
+
+    try:
+        import httpx
+        ollama_host  = os.getenv("OLLAMA_HOST",  "http://localhost:11434")
+        ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
+        prompt = (
+            f"You are a senior network security engineer writing a professional audit report. "
+            f"The host {ip} is running {os_name}. "
+            f"Open ports/services: {port_list or 'None detected'}. "
+            f"Confirmed vulnerabilities: {vuln_summary or 'None'}. "
+            f"Write 6 to 8 concise, specific, step-by-step manual hardening actions that a system "
+            f"administrator can perform RIGHT NOW without specialised tools. "
+            f"Format each step on its own line starting with a dash (-). "
+            f"Include actual commands, configuration paths, or specific service names. "
+            f"Group steps logically (e.g., ## Network Hardening, ## Patch Management). "
+            f"Do NOT use markdown bold (**) or bullet points (*). "
+            f"Be practical and actionable, not generic."
+        )
+        payload = {
+            "model": ollama_model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.15, "num_ctx": 768, "num_predict": 350},
+        }
+        _to = httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=5.0)
+        resp = httpx.post(f"{ollama_host}/api/generate", json=payload, timeout=_to)
+        if resp.status_code == 200:
+            text = resp.json().get("response", "").strip()
+            if text and len(text) > 40:
+                lines = [l for l in text.split("\n") if l.strip()]
+                _manual_actions_cache[cache_key] = lines
+                return lines
+    except Exception as e:
+        logger.debug(f"[LLM manual] Ollama unavailable: {e}")
+
+    # ── Fallback: pattern-based hardening instructions ──────────────────
+    steps = []
+    svc_names  = [s.get("name", "").lower() for s in services]
+    svc_ports  = {s.get("port", 0) for s in services}
+    vuln_names = [v.get("name", "").lower() for v in vulns]
+
+    steps.append("## Network Hardening")
+    steps.append("- Review all firewall rules and block inbound access to unused ports from untrusted networks.")
+    steps.append("- Run: `netstat -tuln` (Linux) or `netstat -an` (Windows) to verify no unexpected listeners are active.")
+
+    if "ftp" in svc_names or 21 in svc_ports:
+        steps.append("## FTP Service (Port 21)")
+        steps.append("- Disable FTP immediately if not required: `systemctl disable vsftpd && systemctl stop vsftpd`.")
+        steps.append("- If FTP is needed, migrate to SFTP (SSH): edit /etc/ssh/sshd_config and enable 'Subsystem sftp'.")
+        steps.append("- Block port 21 at the firewall: `iptables -A INPUT -p tcp --dport 21 -j DROP`.")
+
+    if "ssh" in svc_names or 22 in svc_ports:
+        steps.append("## SSH Service (Port 22)")
+        steps.append("- Disable root SSH login: set 'PermitRootLogin no' in /etc/ssh/sshd_config, then `systemctl restart sshd`.")
+        steps.append("- Enforce key-based authentication: set 'PasswordAuthentication no' in /etc/ssh/sshd_config.")
+        steps.append("- Change SSH to a non-standard port to reduce automated attack surface.")
+
+    if "telnet" in svc_names or 23 in svc_ports:
+        steps.append("## Telnet Service (Port 23 — CLEARTEXT PROTOCOL)")
+        steps.append("- Telnet transmits data in cleartext. Disable it immediately: `systemctl disable telnet && systemctl stop telnet`.")
+        steps.append("- Replace all Telnet access with SSH (port 22) which provides encrypted sessions.")
+
+    if "smb" in svc_names or 445 in svc_ports or 139 in svc_ports:
+        steps.append("## SMB / File Sharing (Ports 139/445)")
+        steps.append("- Disable SMBv1 (vulnerable to EternalBlue): `Set-SmbServerConfiguration -EnableSMB1Protocol $false` (PowerShell).")
+        steps.append("- Block SMB ports 445 and 139 at the perimeter firewall for all untrusted segments.")
+        steps.append("- Apply all Windows security patches including MS17-010 immediately.")
+
+    if any("http" in n or "web" in n for n in svc_names) or {80, 443, 8080, 8443} & svc_ports:
+        steps.append("## Web Services")
+        steps.append("- Change all default admin credentials on web dashboards immediately.")
+        steps.append("- Enable HTTPS only; disable plain HTTP by redirecting port 80 → 443.")
+        steps.append("- Run a CMS/web application scan with OWASP ZAP to detect injection vulnerabilities.")
+
+    if any("mysql" in n or "postgresql" in n or "redis" in n for n in svc_names):
+        steps.append("## Database Services")
+        steps.append("- Ensure database services are not exposed to untrusted networks — bind to 127.0.0.1 only.")
+        steps.append("- Set strong passwords for all database accounts and remove anonymous/blank-password accounts.")
+        steps.append("- Review database logs for any sign of unauthorised access.")
+
+    steps.append("## Patch Management")
+    steps.append("- Run system updates immediately: `apt update && apt upgrade -y` (Debian/Ubuntu) or `yum update -y` (RHEL/CentOS).")
+    steps.append("- Enable automatic security updates to prevent future exposure windows.")
+    steps.append("- Re-scan this host after patching to confirm all findings are resolved.")
+
+    _manual_actions_cache[cache_key] = steps
+    return steps
+
+
 async def generate_pdf_report(scan_id: str) -> bytes:
+
     # ── Lazy imports (avoids circular deps) ────────────────────────────
     from main import AsyncSessionLocal, Scan, Host, select, selectinload, compute_health_score
     from services.audit_analysis import (
@@ -1984,58 +2111,169 @@ async def generate_pdf_report(scan_id: str) -> bytes:
             host_elems.append(ThinRule(BODY_W, C["grid"]))
             host_elems.append(Spacer(1, 4))
             host_elems.append(build_ports_table(h["services"], styles))
+            host_elems.append(Spacer(1, 10))
+
+            # ── Open Ports Evidence (terminal block showing scan proof) ──
+            host_elems.append(Paragraph("Open Ports — Scan Evidence", styles["h3"]))
+            host_elems.append(ThinRule(BODY_W, C["grid"]))
+            host_elems.append(Spacer(1, 4))
+            port_ev_lines = []
+            port_ev_lines.append(f"Nmap scan results for {h['ip']}")
+            port_ev_lines.append(f"Host status: UP  |  Open services discovered: {len(h['services'])}")
+            port_ev_lines.append("")
+            port_ev_lines.append(f"PORT      STATE  SERVICE        VERSION/BANNER")
+            port_ev_lines.append("-" * 65)
+            for svc in h["services"]:
+                svc_name = (svc.get("name") or "unknown")[:14].ljust(14)
+                banner   = (svc.get("version") or svc.get("banner") or "")[:30]
+                proto    = svc.get("protocol", "tcp")
+                port_ev_lines.append(
+                    f"{svc['port']}/{proto:<5} open   {svc_name} {banner}"
+                )
+            port_ev_lines.append("")
+            port_ev_lines.append("[Evidence source: Nmap service/version scan — real-time capture]")
+            port_ev_output = "\n".join(port_ev_lines)
+            port_ev_ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            host_elems.extend(build_terminal_snapshot(
+                f"NMAP PORT SCAN  │  {h['ip']}",
+                f"nmap -sV -p- {h['ip']}",
+                port_ev_output,
+                port_ev_ts,
+            ))
+            host_elems.append(Paragraph(
+                f"Fig: Nmap open port discovery — {h['ip']}  │  {port_ev_ts}",
+                styles["caption"]))
             host_elems.append(Spacer(1, 14))
 
         # ── Vulnerabilities ───────────────────────────────────────────
         meaningful = [v for v in h["vulnerabilities"]
                       if v.get("severity","info").lower() != "info"]
+        # SORT: Critical → High → Medium → Low (most dangerous first)
+        meaningful = sort_vulns_by_severity(meaningful)
+
+        evidence_items = h.get("evidence", [])
+
         if meaningful:
             host_elems.append(Paragraph("Vulnerabilities & Business Impact", styles["h3"]))
             host_elems.append(ThinRule(BODY_W, C["grid"]))
             host_elems.append(Spacer(1, 6))
 
-            # Summary table first
+            # Summary table first (already sorted)
             host_elems.append(build_vuln_table(meaningful, styles))
             host_elems.append(Spacer(1, 12))
 
-            # Detailed impact per vulnerability
+            # Detailed impact per vulnerability — each with its own evidence
             host_elems.append(Paragraph("Detailed Impact Analysis", styles["h3"]))
             for v in meaningful:
                 host_elems.extend(vuln_impact_block(v, styles))
-            host_elems.append(Spacer(1, 6))
 
-        # ── Evidence Vault ────────────────────────────────────────────
-        evidence_items = h.get("evidence", [])
-        best = pick_best_evidence(evidence_items, max_items=2)
-        if best:
-            host_elems.append(Paragraph("Evidence Vault", styles["h3"]))
-            host_elems.append(ThinRule(BODY_W, C["grid"]))
-            host_elems.append(Spacer(1, 6))
-            for ev in best:
-                host_elems.extend(render_evidence_item(ev, h["ip"], styles))
+                # ── Attach matching evidence directly under this vulnerability ──
+                vuln_name_low  = (v.get("name") or "").lower()
+                vuln_cve       = (v.get("cve_id") or "").lower()
+                vuln_src       = (v.get("source") or "").lower()
+                vuln_tmpl      = (v.get("template_id") or "").lower()
+
+                # Match NSE evidence to this vuln
+                matched_ev = []
+                for ev in evidence_items:
+                    ev_out = (ev.get("output") or ev.get("content") or "").lower()
+                    ev_sid = (ev.get("script_id") or "").lower()
+                    ev_lbl = (ev.get("label") or "").lower()
+                    # Check if evidence is relevant to this specific vulnerability
+                    cve_match    = vuln_cve and vuln_cve in ev_out
+                    script_match = vuln_tmpl and vuln_tmpl in ev_sid
+                    name_words   = [w for w in vuln_name_low.split() if len(w) > 4]
+                    name_match   = any(w in ev_out or w in ev_sid or w in ev_lbl
+                                       for w in name_words[:3])
+                    if cve_match or script_match or name_match:
+                        matched_ev.append(ev)
+
+                # If credential-related vuln, also attach text/auth evidence
+                if vuln_src in ("credential_test",) or "credential" in vuln_name_low or "default" in vuln_name_low:
+                    for ev in evidence_items:
+                        if ev.get("type") in ("text", "auth_screenshot") and ev not in matched_ev:
+                            matched_ev.append(ev)
+
+                # Render up to 2 matched evidence items for this vuln
+                if matched_ev:
+                    ev_header_s = ParagraphStyle(
+                        "_vev_hdr", fontName="Helvetica-Bold", fontSize=9,
+                        textColor=C["mid_gray"], leading=12)
+                    host_elems.append(Paragraph(
+                        f"▸ Evidence for: {xml_escape(v.get('name','')[:70])}",
+                        ev_header_s))
+                    host_elems.append(Spacer(1, 4))
+                    for ev in matched_ev[:2]:
+                        host_elems.extend(render_evidence_item(ev, h["ip"], styles))
+
+                host_elems.append(Spacer(1, 4))
+
             host_elems.append(Spacer(1, 6))
 
         # ── Web screenshots (all, after other evidence) ────────────────
-        web_shots = [e for e in evidence_items if e.get("type") in ("web_screenshot","auth_screenshot")]
-        for ev in web_shots[:1]:   # max 1 screenshot per host to keep report lean
-            path = ev.get("path","")
-            if path and os.path.exists(path):
-                try:
-                    img = Image(path, width=BODY_W, height=3.6*inch)
-                    img.hAlign = "LEFT"
-                    frame = Table([[img]], colWidths=[BODY_W])
-                    frame.setStyle(TableStyle([
-                        ("BOX",     (0,0), (-1,-1), 2, C["dark_blue"]),
-                        ("PADDING", (0,0), (-1,-1), 3),
-                    ]))
-                    host_elems.append(frame)
-                    host_elems.append(Paragraph(
-                        f"Fig: Live web capture — {ev.get('label','')}", styles["caption"]))
-                    host_elems.append(Spacer(1, 8))
-                except Exception:
-                    pass
+        # Avoid redundancy: if an auth_screenshot is available for a port, do not render the web_screenshot
+        ports_with_auth = {
+            int(ev.get("port")) for ev in evidence_items
+            if ev.get("type") == "auth_screenshot" and ev.get("port") is not None
+        }
 
-        # ── Remediation ───────────────────────────────────────────────
+        for ev in evidence_items:
+            ev_type = ev.get("type")
+            if ev_type in ["web_screenshot", "auth_screenshot"]:
+                if ev_type == "web_screenshot" and ev.get("port") is not None and int(ev.get("port")) in ports_with_auth:
+                    continue
+
+                img_path = ev.get("path")
+                if img_path and os.path.exists(img_path):
+                    try:
+                        host_elems.append(PageBreak()) # Add a new page for the screenshot
+                        
+                        # Set Title based on the type of screenshot
+                        if ev_type == "web_screenshot":
+                            title = "Initial Login Page (Unauthenticated)"
+                            subtitle = f"Target: {h.get('ip')}:{ev.get('port', '80')} - Before Login"
+                        else:
+                            title = "Admin Dashboard (Authenticated)"
+                            subtitle = f"Successfully logged in using default credentials"
+                        
+                        title_style = ParagraphStyle(
+                            "ScreenshotTitle",
+                            fontName="Helvetica-Bold",
+                            fontSize=16,
+                            leading=20,
+                            textColor=C["dark_blue"],
+                            spaceAfter=6
+                        )
+                        subtitle_style = ParagraphStyle(
+                            "ScreenshotSubtitle",
+                            fontName="Helvetica-Oblique",
+                            fontSize=10,
+                            leading=14,
+                            textColor=C["mid_gray"],
+                            spaceAfter=12
+                        )
+                        
+                        host_elems.append(Paragraph(title, title_style))
+                        host_elems.append(Paragraph(subtitle, subtitle_style))
+                        host_elems.append(Spacer(1, 8))
+                        
+                        # Render Image
+                        img = Image(img_path, width=BODY_W, height=3.8*inch)
+                        img.hAlign = "LEFT"
+                        frame = Table([[img]], colWidths=[BODY_W])
+                        frame.setStyle(TableStyle([
+                            ("BOX",     (0,0), (-1,-1), 2, C["dark_blue"]),
+                            ("PADDING", (0,0), (-1,-1), 3),
+                        ]))
+                        host_elems.append(frame)
+                        host_elems.append(Spacer(1, 6))
+                        host_elems.append(Paragraph(
+                            f"Fig: Live web capture — {ev.get('label','')}", styles["caption"]))
+                        host_elems.append(Spacer(1, 10))
+                    except Exception as e:
+                        logger.error(f"Error rendering screenshot {img_path}: {e}")
+
+        # ── Remediation Strategy ───────────────────────────────────────
         host_elems.append(Paragraph("Remediation Strategy", styles["h3"]))
         host_elems.append(ThinRule(BODY_W, C["grid"]))
         host_elems.append(Spacer(1, 6))
@@ -2043,7 +2281,7 @@ async def generate_pdf_report(scan_id: str) -> bytes:
         # Gather LLM remediation for each meaningful vulnerability on this host
         recs = []
         seen = set()
-        for v in (meaningful or [])[:4]:   # top 4 vulns to keep box compact
+        for v in (meaningful or [])[:4]:   # top 4 vulns (already sorted critical-first)
             cve   = v.get("cve_id") or ""
             cvss  = f"{v['cvss_score']:.1f}" if v.get("cvss_score") else "—"
             raw_r = v.get("remediation") or ""
@@ -2060,10 +2298,47 @@ async def generate_pdf_report(scan_id: str) -> bytes:
                 break
 
         if not recs:
-            # Absolute last resort if host has no vulns at all
             recs = ["No critical vulnerabilities detected — maintain current patch cycle "
                     "and schedule a follow-up scan in 30 days."]
         host_elems.append(rec_box(recs[:6], styles))
+        host_elems.append(Spacer(1, 14))
+
+        # ── LLM Manual Actions — What YOU Can Do Right Now ────────────
+        host_elems.append(Paragraph("Manual Actions & Hardening Instructions", styles["h3"]))
+        host_elems.append(ThinRule(BODY_W, C["grid"]))
+        host_elems.append(Spacer(1, 6))
+        manual_steps = _get_manual_actions_sync(
+            h["ip"],
+            h.get("os") or "Unknown",
+            h.get("services", []),
+            meaningful,
+        )
+        manual_s = ParagraphStyle("_manual", fontName="Helvetica", fontSize=9,
+                                   leading=14, textColor=colors.HexColor("#1A3A5C"))
+        manual_bold_s = ParagraphStyle("_manual_b", fontName="Helvetica-Bold", fontSize=9,
+                                        leading=13, textColor=C["dark_blue"])
+        manual_box_rows = []
+        for step in manual_steps:
+            if step.startswith("##") or step.startswith("**"):
+                clean = step.lstrip("# *").strip()
+                manual_box_rows.append([Paragraph(xml_escape(clean), manual_bold_s)])
+            else:
+                clean = step.lstrip("-•· ").strip()
+                if clean:
+                    manual_box_rows.append([Paragraph(f"  ▶  {xml_escape(clean)}", manual_s)])
+        if manual_box_rows:
+            manual_table = Table(manual_box_rows, colWidths=[BODY_W - 28])
+            manual_table.setStyle(TableStyle([
+                ("BACKGROUND",   (0,0), (-1,-1), colors.HexColor("#EBF4FA")),
+                ("TOPPADDING",   (0,0), (-1,-1), 4),
+                ("BOTTOMPADDING",(0,0), (-1,-1), 4),
+                ("LEFTPADDING",  (0,0), (-1,-1), 10),
+                ("RIGHTPADDING", (0,0), (-1,-1), 10),
+                ("LINELEFT",     (0,0), (-1,-1), 4, C["dark_blue"]),
+                ("BOX",          (0,0), (-1,-1), 0.6, C["dark_blue"]),
+            ]))
+            host_elems.append(manual_table)
+        host_elems.append(Spacer(1, 8))
 
         story.append(KeepTogether(host_elems[:12]))  # keep first block together
         story.extend(host_elems[12:])                # rest flows naturally
@@ -2078,29 +2353,38 @@ async def generate_pdf_report(scan_id: str) -> bytes:
             f"Across all {len(hosts)} audited hosts, the scanner identified "
             f"<b>{len(all_vulns)} total findings</b> — "
             f"<b>{crit_count} critical</b>, <b>{high_count} high</b>, "
-            f"<b>{med_count} medium</b>.", styles["body"]))
+            f"<b>{med_count} medium</b>. "
+            f"Findings are listed in order from most critical to least critical.",
+            styles["body"]))
         story.append(Spacer(1, 12))
 
-        # Full consolidated table
-        story.append(Paragraph("Consolidated Vulnerability Registry", styles["h3"]))
+        # Full consolidated table — sorted CRITICAL → HIGH → MEDIUM → LOW
+        story.append(Paragraph("Consolidated Vulnerability Registry (Severity-Ordered)", styles["h3"]))
         all_rows = [[Paragraph("HOST",     styles["th"]),
                      Paragraph("SEVERITY", styles["th"]),
                      Paragraph("NAME",     styles["th"]),
                      Paragraph("CVE",      styles["th"]),
                      Paragraph("CVSS",     styles["th"])]]
+        # Collect all vulns with their host IP and sort by severity
+        all_host_vulns = []
         for h in hosts:
             for v in h["vulnerabilities"]:
-                sev   = v.get("severity","info")
-                sev_c = sev_color(sev)
-                sev_p = ParagraphStyle("_sv2", fontName="Helvetica-Bold", fontSize=8,
-                                        textColor=sev_c)
-                all_rows.append([
-                    Paragraph(h["ip"],                                styles["td_mono"]),
-                    Paragraph(sev.upper(),                            sev_p),
-                    Paragraph(xml_escape(v.get("name","?")[:50]),     styles["td"]),
-                    Paragraph(v.get("cve_id") or "—",                 styles["td_mono"]),
-                    Paragraph(f"{v['cvss_score']:.1f}" if v.get("cvss_score") else "—", styles["td"]),
-                ])
+                all_host_vulns.append((h["ip"], v))
+        all_host_vulns.sort(
+            key=lambda hv: SEV_ORDER.get(str(hv[1].get("severity","info")).lower(), 4)
+        )
+        for host_ip, v in all_host_vulns:
+            sev   = v.get("severity","info")
+            sev_c = sev_color(sev)
+            sev_p = ParagraphStyle("_sv2", fontName="Helvetica-Bold", fontSize=8,
+                                    textColor=sev_c)
+            all_rows.append([
+                Paragraph(host_ip,                                styles["td_mono"]),
+                Paragraph(sev.upper(),                            sev_p),
+                Paragraph(xml_escape(v.get("name","?")[:50]),     styles["td"]),
+                Paragraph(v.get("cve_id") or "—",                 styles["td_mono"]),
+                Paragraph(f"{v['cvss_score']:.1f}" if v.get("cvss_score") else "—", styles["td"]),
+            ])
         all_vuln_table = Table(all_rows,
                                colWidths=[1.1*inch, 0.85*inch, 3.1*inch, 1.2*inch, 0.6*inch])
         vs_cmds = [
